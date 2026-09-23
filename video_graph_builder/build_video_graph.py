@@ -59,8 +59,15 @@ def build_segments_for_video(sc, video_path, fps, min_seconds, num_montage_frame
     video_fps = vr.get_avg_fps()
     video_id = _video_id(video_path)
 
+    last_sampled_idx = len(frame_indices) - 1
+
     def make_segment(segment_id, level, start_idx, end_idx, parent_id):
-        sample_idxs = sample_frame_indices(start_idx, end_idx, num_montage_frames)
+        # end_idx is the next segment's first frame (a boundary at i means
+        # frame i starts the new segment), so it's excluded from the montage --
+        # otherwise the caption describes the next scene. The video's final
+        # segment ends on the last sampled frame, which it does own.
+        last_in_span = end_idx if end_idx >= last_sampled_idx else max(start_idx, end_idx - 1)
+        sample_idxs = sample_frame_indices(start_idx, last_in_span, num_montage_frames)
         raw_idxs = [frame_indices[min(idx, len(frame_indices) - 1)] for idx in sample_idxs]
         raw_frames = vr.get_batch(raw_idxs).asnumpy()
         montage = build_montage([Image.fromarray(f) for f in raw_frames])
