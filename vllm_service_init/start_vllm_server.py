@@ -33,6 +33,7 @@ from PIL import Image
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from verl.utils.vllm_utils import VLLMHijack
+from video_graph_builder.parsing import parse_caption_entities
 # ------------------------- Command-Line Arguments ------------------------- #
 # (This section remains unchanged)
 parser = argparse.ArgumentParser()
@@ -83,6 +84,15 @@ judge_sample_params = vllm.SamplingParams(
     temperature=0.0,
     top_p=1.0,
     top_k=-1,
+    stop_token_ids=[tokenizer.eos_token_id],
+    n=1,
+)
+
+caption_sample_params = vllm.SamplingParams(
+    max_tokens=512,
+    temperature=0.2,
+    top_p=0.9,
+    top_k=40,
     stop_token_ids=[tokenizer.eos_token_id],
     n=1,
 )
@@ -277,6 +287,27 @@ def build_validity_chat(question, img, declared_skill):
         "<|im_start|>assistant\n"
     )
     return {"prompt": prompt, "multi_modal_data": {"image": img}}
+
+
+def build_caption_entities_chat(montage_img):
+    prompt = (
+        "<|im_start|>system\n"
+        "You are a precise video segment annotator. You are shown one image that horizontally "
+        "concatenates a few frames sampled from a short video segment, left = earliest, right = "
+        "latest. Describe what happens across the segment (not just one frame), and list the "
+        "distinct people/objects/entities visible.\n"
+        "<|im_end|>\n"
+        "<|im_start|>user\n"
+        "<|vision_start|><|image_pad|><|vision_end|>"
+        "Respond with a fenced ```json block containing exactly this shape:\n"
+        "{\"caption\": \"one or two sentence description of the action across the segment\", "
+        "\"entities\": [{\"name\": \"short entity name\", \"type\": \"person|object|animal|other\", "
+        "\"description\": \"short visual description usable to re-identify this entity in another segment\"}]}\n"
+        "Only include entities you can actually see. Output nothing outside the fenced json block.\n"
+        "<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+    return {"prompt": prompt, "multi_modal_data": {"image": montage_img}}
 
 
 def process_validity_single(question, declared_skill, response):
@@ -632,6 +663,92 @@ def judge_validity():
     pause_event.clear()
     print(f'[server] Processed validity {name}, results saved to {out_path}. Resuming idle worker.')
     return jsonify({'message': f'Processed validity {name}, results saved to {out_path}.'})
+
+
+@app.route('/caption_entities', methods=['GET'])
+def caption_entities():
+    pause_event.set()
+    torch.cuda.synchronize()
+
+    name = request.args.get('name', 'None')
+    print(f'[server] Received caption_entities request for task file: {name}')
+
+    with open(name, 'r') as f:
+        data = json.load(f)
+    os.remove(name)
+
+    segment_ids = [item.get('segment_id', '') for item in data]
+    images = [item.get('image', '') for item in data]
+
+    pil_images = []
+    for img_b64 in images:
+        if img_b64:
+            try:
+                pil_images.append(base64_to_pil(img_b64))
+            except Exception as e:
+                print(f"[warning] Image decode failed in caption_entities: {e}")
+                pil_images.append(None)
+        else:
+            pil_images.append(None)
+
+    valid_chats = []
+    valid_chat_items = []
+    valid_indices = []
+    results_all = [
+        {
+            'segment_id': segment_id,
+            'caption': '',
+            'entities': [],
+            'reason': 'missing segment_id or image',
+        }
+        for segment_id in segment_ids
+    ]
+
+    for idx, (segment_id, img) in enumerate(zip(segment_ids, pil_images)):
+        if segment_id and img:
+            valid_chats.append(build_caption_entities_chat(img))
+            valid_chat_items.append({
+                "prompt_index": idx,
+                "segment_id": segment_id,
+                "image_size": {"width": img.width, "height": img.height},
+            })
+            valid_indices.append(idx)
+
+    if valid_chats:
+        with generation_lock:
+            responses = generate_with_fallback(
+                name,
+                "caption_entities",
+                valid_chats,
+                caption_sample_params,
+                valid_chat_items,
+                use_tqdm=True,
+            )
+        for idx, response in zip(valid_indices, responses):
+            if response is not None:
+                raw_text = response.outputs[0].text if response.outputs else ""
+                parsed = parse_caption_entities(raw_text)
+                results_all[idx] = {
+                    "segment_id": segment_ids[idx],
+                    "caption": parsed["caption"],
+                    "entities": parsed["entities"],
+                    "reason": "",
+                }
+            else:
+                results_all[idx] = {
+                    "segment_id": segment_ids[idx],
+                    "caption": "",
+                    "entities": [],
+                    "reason": "generation failed",
+                }
+
+    out_path = name.replace('.json', '_results.json')
+    with open(out_path, 'w') as f:
+        json.dump(results_all, f, indent=4)
+
+    pause_event.clear()
+    print(f'[server] Processed caption_entities {name}, results saved to {out_path}. Resuming idle worker.')
+    return jsonify({'message': f'Processed caption_entities {name}, results saved to {out_path}.'})
 
 # ------------------------- Main Application Entrypoint --------------------------- #
 # (This section remains unchanged)

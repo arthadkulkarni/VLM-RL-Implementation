@@ -64,14 +64,22 @@ PY
   done
 }
 
-start_one_server 4 6000
-start_one_server 5 6001
-start_one_server 6 6002
-start_one_server 7 6003
+# GPU offset where reward servers start (training uses GPUs 0..offset-1) and how many
+# reward servers to launch (one per remaining GPU, ports 6000..6000+n-1). Must match
+# RISE_REWARD_SERVERS read by train_examples/reward_function/cot_val.py.
+gpu_offset="${RISE_REWARD_GPU_OFFSET:-4}"
+num_servers="${RISE_REWARD_SERVERS:-4}"
 
-wait_for_server 6000
-wait_for_server 6001
-wait_for_server 6002
-wait_for_server 6003
+ports=()
+for ((i = 0; i < num_servers; i++)); do
+  cuda_id=$((gpu_offset + i))
+  port=$((6000 + i))
+  ports+=("$port")
+  start_one_server "$cuda_id" "$port"
+done
+
+for port in "${ports[@]}"; do
+  wait_for_server "$port"
+done
 
 echo "[vllm-start] all judge servers are healthy"
