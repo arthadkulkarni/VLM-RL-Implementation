@@ -47,3 +47,30 @@ def build_montage(frames, labels=("first", "mid", "last")):
         x += frame.width + GUTTER
 
     return montage
+
+
+# Two stacked full-resolution montages can exceed the caption servers'
+# max_model_len in image tokens alone; ~2M pixels is ~2k Qwen3-VL tokens.
+MAX_PAIR_PIXELS = 2_000_000
+
+
+def stack_montages(top, bottom, labels=("Segment A", "Segment B"), max_pixels=MAX_PAIR_PIXELS):
+    """Vertically stack two segment montages (each already a left-to-right
+    frame strip) into one labelled image, so a single-image VLM prompt can
+    compare entities across the two segments.
+    """
+    width = max(top.width, bottom.width)
+    height = top.height + bottom.height + 2 * LABEL_HEIGHT + GUTTER
+    stacked = Image.new("RGB", (width, height), BG_COLOR)
+    draw = ImageDraw.Draw(stacked)
+
+    y = 0
+    for montage, label in zip((top, bottom), labels):
+        draw.text((4, y + 2), label, fill=TEXT_COLOR)
+        stacked.paste(montage, (0, y + LABEL_HEIGHT))
+        y += LABEL_HEIGHT + montage.height + GUTTER
+
+    scale = (max_pixels / (width * height)) ** 0.5
+    if scale < 1:
+        stacked = stacked.resize((max(1, round(width * scale)), max(1, round(height * scale))))
+    return stacked

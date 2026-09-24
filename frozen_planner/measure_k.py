@@ -1,8 +1,9 @@
 """Measure K = |C(x, q)| per category over a directory of video graphs, before
-training. Relational categories are the ones to watch: sequential and
-synchronous (proximity) pairs are bounded by ~N * window, but causal
-(shared-entity) pairs can grow ~N^2 when one linked entity spans most of the
-video. Anything that looks superlinear is flagged.
+training. Every category should grow at most linearly in the number of
+timeline segments N (causal: <= causal_next_appearances * entity
+appearances); anything that looks superlinear is flagged, as is any
+category whose K exceeds the per-question budget -- linear growth still
+means large K on long videos.
 
 Usage:
   python -m frozen_planner.measure_k --graph_dir <dir> [--out report.json]
@@ -51,7 +52,7 @@ def measure_video(graph, config):
         row["k"][category] = len(candidates)
 
     # Share of the timeline covered by the single most widespread entity --
-    # the driver of shared-entity pair growth (m segments -> m(m-1)/2 pairs).
+    # the main driver of causal K (m appearances -> ~causal_next_appearances * m pairs).
     coverage = {}
     for sid in view.timeline:
         for entity_id in view.entities(sid):
@@ -96,14 +97,14 @@ def main():
     parser.add_argument("--graph_dir", required=True)
     parser.add_argument("--out", default=None, help="Optional JSON report path.")
     parser.add_argument("--window_segments", type=int, default=PlannerConfig.window_segments)
-    parser.add_argument("--max_entity_gap_segments", type=int, default=None)
+    parser.add_argument("--causal_next_appearances", type=int, default=PlannerConfig.causal_next_appearances)
     parser.add_argument("--sync_tolerance_sec", type=float, default=PlannerConfig.sync_tolerance_sec)
     parser.add_argument("--k_budget", type=int, default=128, help="Flag categories whose max K exceeds this.")
     args = parser.parse_args()
 
     config = PlannerConfig(
         window_segments=args.window_segments,
-        max_entity_gap_segments=args.max_entity_gap_segments,
+        causal_next_appearances=args.causal_next_appearances,
         sync_tolerance_sec=args.sync_tolerance_sec,
     )
 

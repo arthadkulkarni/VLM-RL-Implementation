@@ -8,15 +8,15 @@ Verifier's job, and the Verifier is the only place judgment happens.
 
 Single-event categories yield one candidate per matching segment. Relational
 categories yield segment pairs by pure structural enumeration: causal pairs
-must share a linked entity, sequential pairs must be close on the timeline,
+must share a linked entity (each appearance paired with that entity's next
+few appearances), sequential pairs must be close on the timeline,
 synchronous pairs must be close in time. Pair plausibility is deliberately
 NOT delegated to an LLM.
 """
 
 from dataclasses import dataclass
-from typing import Optional
 
-SINGLE_EVENT_CATEGORIES = ("static", "dynamic", "identity", "bounded")
+SINGLE_EVENT_CATEGORIES = ("static", "dynamic", "identity", "bounded", "negative")
 RELATIONAL_CATEGORIES = ("causal", "sequential", "synchronous")
 CATEGORIES = SINGLE_EVENT_CATEGORIES + RELATIONAL_CATEGORIES
 
@@ -25,10 +25,13 @@ CATEGORIES = SINGLE_EVENT_CATEGORIES + RELATIONAL_CATEGORIES
 class PlannerConfig:
     # sequential: pair timeline segments at most this many positions apart.
     window_segments: int = 3
-    # causal: pairs must share a linked entity; optionally also cap their
-    # timeline distance (None = unbounded). Unbounded, one entity present
-    # throughout the video gives ~N^2/2 pairs -- measure_k.py reports it.
-    max_entity_gap_segments: Optional[int] = None
+    # causal: pair each appearance of a linked entity with that entity's next
+    # this-many appearances on the timeline. Keeps K linear in video length
+    # (<= this * total appearances) while still pairing an entity's last
+    # appearance before it leaves with its first after it returns, however
+    # far apart. Pairing all appearances instead is ~N^2/2 for one entity
+    # present throughout (258,840 pairs for 720 segments).
+    causal_next_appearances: int = 2
     # synchronous: pair segments whose spans overlap or are at most this many
     # seconds apart (timeline segments never overlap, so this is what admits
     # neighbours across a cut).
@@ -83,8 +86,13 @@ def _pair_candidate(view, category, first_id, second_id, basis):
 
 
 def _overlaps(seg, time_bounds):
+    """Positive-length overlap with [lo, hi] -- a segment that only touches a
+    bound is outside it. A point bound (lo == hi) selects the segment
+    containing that instant (start inclusive)."""
     lo, hi = time_bounds
-    return seg["end_sec"] >= lo and seg["start_sec"] <= hi
+    if lo == hi:
+        return seg["start_sec"] <= lo < seg["end_sec"]
+    return seg["end_sec"] > lo and seg["start_sec"] < hi
 
 
 def single_event_segment_ids(view, category, time_bounds=None):
@@ -96,6 +104,8 @@ def single_event_segment_ids(view, category, time_bounds=None):
       identity -> timeline nodes that mention at least one linked entity
       bounded  -> timeline nodes overlapping time_bounds=(start_sec, end_sec);
                   every timeline node when q carries no bounds
+      negative -> every timeline node; q asserts something absent, so the
+                  Verifier is expected to reject all of them
     """
     if category == "static":
         return list(view.scenes)
@@ -107,6 +117,8 @@ def single_event_segment_ids(view, category, time_bounds=None):
         if time_bounds is None:
             return list(view.timeline)
         return [sid for sid in view.timeline if _overlaps(view.segments[sid], time_bounds)]
+    if category == "negative":
+        return list(view.timeline)
     raise ValueError(f"not a single-event category: {category}")
 
 
@@ -122,18 +134,20 @@ def sequential_pairs(view, config):
 
 def causal_pairs(view, config):
     """causal: (earlier, later) timeline pairs that share a linked entity,
-    optionally at most max_entity_gap_segments apart."""
+    where the later segment is among that entity's next
+    causal_next_appearances appearances after the earlier one."""
+    appearances = {}
+    for segment_id in view.timeline:
+        for entity_id in sorted(view.entities(segment_id)):
+            appearances.setdefault(entity_id, []).append(segment_id)
+
     pairs = {}
-    timeline = view.timeline
-    for i, first_id in enumerate(timeline):
-        first_entities = view.entities(first_id)
-        if not first_entities:
-            continue
-        stop = len(timeline) if config.max_entity_gap_segments is None else i + 1 + config.max_entity_gap_segments
-        for second_id in timeline[i + 1:stop]:
-            if first_entities & view.entities(second_id):
+    for segment_ids in appearances.values():
+        for i, first_id in enumerate(segment_ids):
+            for second_id in segment_ids[i + 1:i + 1 + config.causal_next_appearances]:
                 pairs[(first_id, second_id)] = {"shared_entity"}
-    return pairs
+    # timeline order, so candidate ids stay deterministic and time-sorted
+    return dict(sorted(pairs.items(), key=lambda item: (view.position[item[0][0]], view.position[item[0][1]])))
 
 
 def synchronous_pairs(view, config):
