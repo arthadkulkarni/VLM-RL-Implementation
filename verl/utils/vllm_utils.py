@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from importlib.metadata import version
 from typing import List
 
@@ -128,3 +129,18 @@ class VLLMHijack:
                 )
 
             setattr(Qwen3VLForConditionalGeneration, "get_mm_mapping", hijack__get_mm_mapping)
+
+        if os.getenv("RISE_FORCE_VIT_SDPA", "0") == "1":
+            # Without flash-attn or xformers installed, vLLM's Qwen2.5-VL/Qwen3-VL
+            # vision tower falls through get_vit_attn_backend() straight to XFORMERS
+            # on Hopper (see vllm/platforms/cuda.py) and crashes on
+            # `from xformers import ops`, even though the model's forward() already
+            # has a working TORCH_SDPA branch. Force that branch instead of building
+            # either package, for environments (like a smoke test) that don't need
+            # flash-attn's speed.
+            from vllm.platforms.cuda import CudaPlatformBase
+            from vllm.platforms.interface import _Backend
+
+            CudaPlatformBase.get_vit_attn_backend = classmethod(
+                lambda cls, head_size, dtype: _Backend.TORCH_SDPA
+            )

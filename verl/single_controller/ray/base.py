@@ -300,14 +300,27 @@ class RayWorkerGroup(WorkerGroup):
 
                 if rank == 0:
                     register_center_actor = None
-                    for _ in range(120):
+                    # GH200/ARM nodes can take much longer than typical x86 clusters to
+                    # schedule the placement group and bring up CUDA context, so the wait
+                    # is configurable rather than a fixed 120s.
+                    register_center_timeout = int(os.getenv("VERL_REGISTER_CENTER_TIMEOUT_SEC", "900"))
+                    for _ in range(register_center_timeout):
                         if f"{self.name_prefix}_register_center" not in list_named_actors():
+                            worker_state = get_actor(worker._actor_id.hex())
+                            if worker_state is not None and worker_state.get("state") == "DEAD":
+                                raise RuntimeError(
+                                    f"Rank 0 worker '{name}' died before it could register "
+                                    f"'{self.name_prefix}_register_center' (death_cause: "
+                                    f"{worker_state.get('death_cause')}). Check the worker's "
+                                    "own stderr/stdout for the real exception."
+                                )
                             time.sleep(1)
                         else:
                             register_center_actor = ray.get_actor(f"{self.name_prefix}_register_center")
                             break
                     assert register_center_actor is not None, (
-                        f"failed to get register_center_actor: {self.name_prefix}_register_center in {list_named_actors(all_namespaces=True)}"
+                        f"failed to get register_center_actor: {self.name_prefix}_register_center "
+                        f"within {register_center_timeout}s in {list_named_actors(all_namespaces=True)}"
                     )
                     rank_zero_info = ray.get(register_center_actor.get_rank_zero_info.remote())
                     self._master_addr, self._master_port = rank_zero_info["MASTER_ADDR"], rank_zero_info["MASTER_PORT"]

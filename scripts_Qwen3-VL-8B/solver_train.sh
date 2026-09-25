@@ -45,8 +45,11 @@ echo "Questioner model: ${questioner_model_path}"
 echo "Target steps: ${train_steps}"
 echo "Training data: ${solver_train_parquet}"
 
-# Disable vLLM compile cache to avoid stale kernel/cache issues across alternating stages.
-export VLLM_DISABLE_COMPILE_CACHE=1
+# vLLM compile cache is on by default (see vllm_service_init/start.sh);
+# RISE_VLLM_COMPILE_CACHE=0 disables it if stale-cache issues show up.
+if [ "${RISE_VLLM_COMPILE_CACHE:-1}" != "1" ]; then
+  export VLLM_DISABLE_COMPILE_CACHE=1
+fi
 
 # Explicit role marker used by the dataset pipeline. Solver training must keep the
 # pseudo-labeled problem/answer fields because the answer is the solver reward target.
@@ -83,9 +86,13 @@ trainer_args=(
   # Solver responses are trained to end with a boxed final answer.
   data.max_response_length=2048
   "data.train_files=${solver_train_parquet}"
-  "data.val_files=${data_dir}/MMStar"
+  "data.val_files=${data_dir}/parquet/zli12321__mmstar" # not used dataset, just for compatibility
   data.format_prompt=./train_examples/format_prompt/solver.jinja
   "worker.actor.model.model_path=${solver_model_path}"
+
+  # padding_free relies on flash-attn's varlen kernels (via RISE_ATTN_IMPLEMENTATION);
+  # a smoke test without flash-attn built should set this to false.
+  "worker.actor.padding_free=${RISE_ACTOR_PADDING_FREE:-true}"
 
   # Keep per-device micro batches small for VLM memory stability.
   worker.actor.micro_batch_size_per_device_for_update=1
@@ -95,6 +102,12 @@ trainer_args=(
 
   # Maximum rollout tokens batched by vLLM during experience generation.
   worker.rollout.max_num_batched_tokens=20000
+
+  # Overridable batch/rollout sizing (defaults match the full-scale config; a smoke
+  # test can shrink these via env vars to run a fast, low-resource iteration).
+  "data.rollout_batch_size=${RISE_ROLLOUT_BATCH_SIZE:-256}"
+  "worker.actor.global_batch_size=${RISE_GLOBAL_BATCH_SIZE:-64}"
+  "worker.rollout.n=${RISE_ROLLOUT_N:-8}"
 
   # Keep the reference model on GPU to avoid CPU offload overhead.
   worker.ref.fsdp.enable_cpu_offload=false
@@ -111,6 +124,7 @@ trainer_args=(
   "trainer.save_checkpoint_path=${model_save_root}/${experiment_name}/"
   trainer.val_before_train=false
   trainer.load_dataloader_state=false
+  "trainer.n_gpus_per_node=${RISE_NUM_GPUS:-8}"
 )
 
 if [ -n "${load_checkpoint_path}" ]; then
