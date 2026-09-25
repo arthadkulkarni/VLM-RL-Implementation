@@ -1,39 +1,45 @@
+from dataclasses import dataclass
+
 import av
 import numpy as np
 
 
-class _FrameBatch:
-    """Minimal stand-in for decord's NDArray batch result."""
+@dataclass
+class SampledVideo:
+    """The frames the graph builder works from: every `interval`-th raw frame
+    (interval = int(video_fps / fps)), decoded once. `frame_indices[k]` is the
+    raw frame index of `frames[k]`; everything downstream (scene/action curves,
+    montages, timestamps) indexes into these."""
 
-    def __init__(self, frames):
-        self._frames = frames
+    frames: list
+    frame_indices: list
+    video_fps: float
+    total_frames: int
 
-    def asnumpy(self):
-        return self._frames
 
+def sample_video(video_path, fps=1.0):
+    """Stream-decode `video_path` with PyAV (decord ships no aarch64 wheels,
+    and this runs on GH200 nodes), keeping only the frames sampled at `fps`.
 
-class VideoReader:
-    """decord.VideoReader-compatible wrapper backed by PyAV (`av`), used
-    instead of decord because decord ships no aarch64/ARM64 wheels and this
-    pipeline runs on GH200 (aarch64) nodes. Decodes the whole video once into
-    memory on construction so frame_indices-based random access (get_batch)
-    works the same way decord's did -- fine for the short clips this module
-    processes, not intended for very long videos.
+    Every frame still has to be decoded (inter-coded video can't skip), but
+    only kept frames are converted to RGB and held in memory: a 102-minute
+    720x540 video at 30 fps keeps ~6k frames (~7 GB) instead of 184k (~214 GB).
     """
-
-    def __init__(self, video_path):
-        container = av.open(video_path)
+    container = av.open(video_path)
+    try:
         stream = container.streams.video[0]
-        self._avg_fps = float(stream.average_rate) if stream.average_rate else 30.0
-        self._frames = [frame.to_ndarray(format="rgb24") for frame in container.decode(stream)]
+        stream.thread_type = "AUTO"
+        video_fps = float(stream.average_rate) if stream.average_rate else 30.0
+        interval = max(1, int(video_fps / fps))
+
+        frames, frame_indices = [], []
+        total = 0
+        for idx, frame in enumerate(container.decode(stream)):
+            if idx % interval == 0:
+                frames.append(frame.to_ndarray(format="rgb24"))
+                frame_indices.append(idx)
+            total = idx + 1
+    finally:
         container.close()
 
-    def __len__(self):
-        return len(self._frames)
-
-    def get_avg_fps(self):
-        return self._avg_fps
-
-    def get_batch(self, indices):
-        selected = np.stack([self._frames[i] for i in indices], axis=0)
-        return _FrameBatch(selected)
+    return SampledVideo(frames=frames, frame_indices=frame_indices, video_fps=video_fps, total_frames=total)

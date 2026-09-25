@@ -50,31 +50,21 @@ def fetch(port, path, endpoint="caption_entities"):
     raise last_exc
 
 
-def caption_entities_batch(items, num_servers, base_port=None, endpoint="caption_entities"):
-    """items: [{"segment_id": str, "image": base64-png-str}, ...]. Shards the
-    request across `num_servers` /caption_entities vLLM servers (ports
-    base_port..base_port+n-1), following the same write-task-file -> GET
-    ?name= -> poll/read/delete _results.json convention as
-    train_examples/reward_function/cot_val.py's generate_results. Returns a
-    flat list of {"segment_id","caption","entities"} dicts (order not
-    guaranteed to match `items`; callers should key by segment_id).
+def _run_shards(payloads, base_port, endpoint):
+    """Write one task file per payload, send payload i to the server on port
+    base_port + i, and return the concatenated result lists. Follows the same
+    write-task-file -> GET ?name= -> read/delete _results.json convention as
+    train_examples/reward_function/cot_val.py's generate_results.
     """
-    if not items:
-        return []
-
-    base_port = base_port if base_port is not None else CAPTION_SERVER_BASE_PORT
-    n = max(1, min(num_servers, len(items)))
-    shards = split_list(items, n)
-    paths = [generate_temp_filename(prefix=f"caption_{i}") for i in range(n)]
-
-    for path, shard in zip(paths, shards):
+    paths = [generate_temp_filename(prefix=f"{endpoint}_{i}") for i in range(len(payloads))]
+    for path, payload in zip(paths, payloads):
         with open(path, "w") as f:
-            json.dump(shard, f)
+            json.dump(payload, f)
 
-    with ThreadPoolExecutor(max_workers=n) as executor:
+    with ThreadPoolExecutor(max_workers=len(payloads)) as executor:
         futures = [
             executor.submit(fetch, base_port + i, paths[i], endpoint)
-            for i in range(n)
+            for i in range(len(payloads))
         ]
         for future in as_completed(futures):
             future.result()
@@ -85,5 +75,40 @@ def caption_entities_batch(items, num_servers, base_port=None, endpoint="caption
         with open(result_path, "r") as f:
             results.extend(json.load(f))
         os.remove(result_path)
-
     return results
+
+
+def caption_entities_batch(items, num_servers, base_port=None):
+    """items: [{"segment_id": str, "image": base64-png-str}, ...]. Shards the
+    request across `num_servers` /caption_entities vLLM servers (ports
+    base_port..base_port+n-1). Returns a flat list of
+    {"segment_id","caption","entities"} dicts (order not guaranteed to match
+    `items`; callers should key by segment_id).
+    """
+    if not items:
+        return []
+    base_port = base_port if base_port is not None else CAPTION_SERVER_BASE_PORT
+    shards = split_list(items, max(1, min(num_servers, len(items))))
+    return _run_shards(shards, base_port, "caption_entities")
+
+
+def same_entity_batch(pairs, montages, num_servers, base_port=None):
+    """pairs: [{"pair_id", "segment_a", "segment_b", "mention_a", "mention_b"}],
+    montages: {segment_id: base64-png-str}. Each /same_entity server gets its
+    shard of pairs plus only the montages those pairs reference, and stacks
+    each pair's two montages itself -- so a montage is sent at most once per
+    server rather than once per pair. Returns [{"pair_id", "same": 0|1, ...}]
+    (key by pair_id).
+    """
+    if not pairs:
+        return []
+    base_port = base_port if base_port is not None else CAPTION_SERVER_BASE_PORT
+    shards = split_list(pairs, max(1, min(num_servers, len(pairs))))
+    payloads = []
+    for shard in shards:
+        referenced = {p["segment_a"] for p in shard} | {p["segment_b"] for p in shard}
+        payloads.append({
+            "montages": {sid: montages[sid] for sid in referenced},
+            "pairs": shard,
+        })
+    return _run_shards(payloads, base_port, "same_entity")

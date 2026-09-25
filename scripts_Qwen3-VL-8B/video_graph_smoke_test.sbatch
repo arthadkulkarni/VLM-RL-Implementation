@@ -10,6 +10,9 @@
 #SBATCH --partition=ghx4-interactive
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:nvidia_gh200_120gb:4
+# Without this SLURM allocates 1 CPU, which the 4 vLLM servers, their image
+# preprocessing and the builder/trainer all end up sharing.
+#SBATCH --cpus-per-task=72
 #SBATCH --time=02:00:00
 #SBATCH --job-name=rise-video-graph-smoke
 #SBATCH --output=logs/video_graph_smoke/%x_%j.log

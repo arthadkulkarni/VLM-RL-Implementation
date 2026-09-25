@@ -19,11 +19,14 @@ def init_raft_small(device: str = 'cuda'):
 
 
 def init_dino_v2(device: str = 'cuda', model_name: str = 'facebook/dinov2-base'):
-    processor = AutoImageProcessor.from_pretrained(model_name)
+    # Fast (torchvision) processor, run on the GPU: the default slow one
+    # resizes/normalizes every frame in numpy on the CPU.
+    processor = AutoImageProcessor.from_pretrained(model_name, use_fast=True)
     model = AutoModel.from_pretrained(model_name).to(device).eval()
 
     def dino_preprocess(images):
-        return processor(images=images, return_tensors='pt')
+        # images: HxWx3 uint8 arrays (or PIL images)
+        return processor(images=images, return_tensors='pt', device=device)
 
     return model, dino_preprocess
 

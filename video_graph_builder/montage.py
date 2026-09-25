@@ -15,10 +15,12 @@ def sample_frame_indices(start, end, num_frames=3):
     return [round(start + i * step) for i in range(num_frames)]
 
 
-def build_montage(frames, labels=("first", "mid", "last")):
+def build_montage(frames, labels=("first", "mid", "last"), max_frame_height=None):
     """Horizontally concatenate sampled frames (left = earliest) into one
     strip image with a thin label row, so a single-image VLM prompt can be
-    used to describe motion across a segment.
+    used to describe motion across a segment. Frames are downscaled to at most
+    max_frame_height: the montage is what every caption, same-entity and
+    Verifier call sees, so its pixel count sets their image-token cost.
     """
     if not frames:
         raise ValueError("build_montage requires at least one frame")
@@ -28,6 +30,8 @@ def build_montage(frames, labels=("first", "mid", "last")):
         labels.append("")
 
     target_height = min(frame.height for frame in frames)
+    if max_frame_height:
+        target_height = min(target_height, max_frame_height)
     resized = []
     for frame in frames:
         if frame.height != target_height:

@@ -3,10 +3,8 @@ import torch.nn as nn
 
 try:
     from .encoders import init_raft_small, init_dino_v2, encode_dino_v2
-    from .video_io import VideoReader
 except ImportError:
     from encoders import init_raft_small, init_dino_v2, encode_dino_v2
-    from video_io import VideoReader
 
 from PIL import Image
 import torch.nn.functional as F
@@ -17,6 +15,9 @@ import numpy as np
 import pywt
 import ruptures as rpt
 
+# RAFT input width; see SimilarityCurves.flow_magnitudes.
+RAFT_WIDTH = 480
+
 class SimilarityCurves(nn.Module):
     def __init__(self, device: str = 'cuda'):
         super().__init__()
@@ -24,42 +25,48 @@ class SimilarityCurves(nn.Module):
         self.raft_model, self.raft_preprocess = init_raft_small(device=device)
         self.dino_model, self.dino_preprocess = init_dino_v2(device=device)
 
-    def _extract_features(self, video_path, fps = 1.0, batch_size = 32):
-        vr = VideoReader(video_path)
-        total_frames = len(vr)
-        video_fps = vr.get_avg_fps()
-        sample_interval = int(video_fps / fps)
-        frame_indices = list(range(0, total_frames, sample_interval))
+    @torch.inference_mode()
+    def dino_features(self, frames, batch_size=64):
+        """DINOv2 CLS embedding per sampled frame (drives scene cuts)."""
+        return torch.cat([
+            encode_dino_v2(self.dino_model, self.dino_preprocess, frames[i:i + batch_size], device=self.device).cpu()
+            for i in range(0, len(frames), batch_size)
+        ], dim=0)
 
-        raw_frames = vr.get_batch(frame_indices).asnumpy()
-        frames = [Image.fromarray(frame) for frame in raw_frames]
+    @torch.inference_mode()
+    def flow_magnitudes(self, frames, batch_size=32):
+        """L2 norm of RAFT flow for every consecutive pair of sampled frames
+        (entry k is frames[k] -> frames[k+1]), batched. Frames are resized to
+        RAFT_WIDTH (dims rounded to multiples of 8, which RAFT requires); the
+        action curve is min-max normalized per segment, so only relative
+        magnitude matters. Only the norm is kept -- full flow fields for a
+        long video would not fit in memory."""
+        if len(frames) < 2:
+            return torch.empty(0)
+        h, w = frames[0].shape[:2]
+        scale = min(1.0, RAFT_WIDTH / w)
+        size = (max(8, round(h * scale / 8) * 8), max(8, round(w * scale / 8) * 8))
 
-        all_dino = []
-        for i in range(0, len(frames), batch_size):
-            batch = frames[i:i + batch_size]
-            all_dino.append(encode_dino_v2(self.dino_model, self.dino_preprocess, batch, device=self.device).cpu())
-        dino_features = torch.cat(all_dino, dim=0)
+        mags = []
+        for i in range(0, len(frames) - 1, batch_size):
+            chunk = torch.from_numpy(np.stack(frames[i:i + batch_size + 1])).to(self.device)
+            chunk = chunk.permute(0, 3, 1, 2).float()
+            chunk = F.interpolate(chunk, size=size, mode="bilinear", antialias=True, align_corners=False)
+            chunk = chunk / 127.5 - 1.0  # RAFT preset: [0, 255] -> [-1, 1]
+            flow = self.raft_model(chunk[:-1].contiguous(), chunk[1:].contiguous())[-1]
+            mags.append(flow.flatten(1).norm(dim=1).cpu())
+        return torch.cat(mags)
 
-        all_flow = []
-        for i in range(len(frames) - 1):
-            t1, t2 = self.raft_preprocess(frames[i], frames[i + 1])
-            t1 = t1.unsqueeze(0).to(self.device)
-            t2 = t2.unsqueeze(0).to(self.device)
-            with torch.inference_mode():
-                flow = self.raft_model(t1, t2)
-            all_flow.append(flow[-1].cpu())
-        raft_features = torch.stack(all_flow)
-
-        return raft_features, dino_features
+    def _extract_features(self, sampled, batch_size=32):
+        return self.flow_magnitudes(sampled.frames), self.dino_features(sampled.frames, batch_size=batch_size)
 
     def compute_scene_similarity(self, dino_features):
         scene_similarity = F.cosine_similarity(dino_features[1:], dino_features[:-1], dim=1)
         scene_similarity = torch.cat([torch.tensor([1.0]), scene_similarity])
         return scene_similarity
 
-    def compute_action_similarity(self, raft_features):
-        magnitude = torch.norm(raft_features.view(raft_features.size(0), -1), dim=1)
-        action_similarity = -magnitude
+    def compute_action_similarity(self, flow_magnitudes):
+        action_similarity = -flow_magnitudes
         action_similarity = torch.cat([torch.tensor([0.0]), action_similarity])
         denom = action_similarity.max() - action_similarity.min()
         action_similarity = (action_similarity - action_similarity.min()) / (denom + 1e-8)
@@ -80,22 +87,8 @@ class SimilarityCurves(nn.Module):
         curve = np.array(signal)
         return gaussian_filter1d(curve, sigma=sigma)
 
-    def compute_scene(self, video_path, fps=1.0, batch_size=32, tau=None):
-        vr = VideoReader(video_path)
-        total_frames = len(vr)
-        video_fps = vr.get_avg_fps()
-        sample_interval = int(video_fps / fps)
-        frame_indices = list(range(0, total_frames, sample_interval))
-
-        raw_frames = vr.get_batch(frame_indices).asnumpy()
-        frames = [Image.fromarray(f) for f in raw_frames]
-
-        all_dino = []
-        for i in range(0, len(frames), batch_size):
-            batch = frames[i:i + batch_size]
-            all_dino.append(encode_dino_v2(self.dino_model, self.dino_preprocess, batch, device=self.device).cpu())
-        dino_features = torch.cat(all_dino, dim=0)
-
+    def compute_scene(self, sampled, batch_size=64, tau=None):
+        dino_features = self.dino_features(sampled.frames, batch_size=batch_size)
         scene_similarity = self.compute_scene_similarity(dino_features)
         scene_curve = self.smooth(scene_similarity)
         scene_bps = self.scene_boundaries(scene_curve, tau=tau)
@@ -103,27 +96,22 @@ class SimilarityCurves(nn.Module):
         return {
             'curve': scene_curve,
             'boundaries': scene_bps,
-            'frame_indices': frame_indices,
-            'num_sampled_frames': len(frame_indices),
+            'frame_indices': sampled.frame_indices,
+            'num_sampled_frames': len(sampled.frame_indices),
         }
 
-    def compute_action_for_segments(self, video_path, fps=1.0, segments=None, pen=0.5, model="rbf"):
-        vr = VideoReader(video_path)
-        total_frames = len(vr)
-        video_fps = vr.get_avg_fps()
-        sample_interval = int(video_fps / fps)
-        all_frame_indices = list(range(0, total_frames, sample_interval))
+    def compute_action_for_segments(self, sampled, segments, pen=0.5, model="rbf"):
+        # One batched RAFT pass over the whole video; each segment's curve is
+        # its slice (a segment's frames start..end give pairs start..end-1).
+        magnitudes = self.flow_magnitudes(sampled.frames)
+        last_idx = len(sampled.frame_indices) - 1
 
         results = []
         for (start, end) in segments:
             start = max(0, start)
-            end = min(len(all_frame_indices) - 1, end)
+            end = min(last_idx, end)
 
-            seg_frame_indices = all_frame_indices[start:end + 1]
-            raw_frames = vr.get_batch(seg_frame_indices).asnumpy()
-            frames = [Image.fromarray(f) for f in raw_frames]
-
-            if len(frames) < 2:
+            if end - start < 1:
                 results.append({
                     'curve': np.array([]),
                     'local_boundaries': [],
@@ -132,17 +120,7 @@ class SimilarityCurves(nn.Module):
                 })
                 continue
 
-            all_flow = []
-            for i in range(len(frames) - 1):
-                t1, t2 = self.raft_preprocess(frames[i], frames[i + 1])
-                t1 = t1.unsqueeze(0).to(self.device)
-                t2 = t2.unsqueeze(0).to(self.device)
-                with torch.inference_mode():
-                    flow = self.raft_model(t1, t2)
-                all_flow.append(flow[-1].cpu())
-            raft_features = torch.stack(all_flow)
-
-            action_sim = self.compute_action_similarity(raft_features)
+            action_sim = self.compute_action_similarity(magnitudes[start:end])
             action_curve = self.smooth(action_sim, threshold_scale=0.2, mode='hard')
             local_bps = self.action_boundaries(action_curve, pen=pen, model=model)
             global_bps = [start + bp for bp in local_bps]
@@ -156,8 +134,8 @@ class SimilarityCurves(nn.Module):
 
         return results
 
-    def compute_all(self, video_path, fps=1.0, batch_size=32):
-        raft_features, dino_features = self._extract_features(video_path, fps=fps, batch_size=batch_size)
+    def compute_all(self, sampled, batch_size=32):
+        raft_features, dino_features = self._extract_features(sampled, batch_size=batch_size)
         scene_similarity = self.compute_scene_similarity(dino_features)
         action_similarity = self.compute_action_similarity(raft_features)
 

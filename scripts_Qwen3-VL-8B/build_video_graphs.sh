@@ -31,7 +31,8 @@ trap runtime_cleanup_all EXIT
 mkdir -p "${OUT_DIR}"
 
 echo "[build-video-graphs] launching ${NUM_SERVERS} caption servers on ports ${BASE_PORT}..$((BASE_PORT + NUM_SERVERS - 1))"
-RISE_REWARD_GPU_OFFSET=0 RISE_REWARD_SERVERS="${NUM_SERVERS}" \
+# No GPU idle worker: the builder's DINOv2/RAFT pass shares GPU 0 with a server.
+RISE_GPU_IDLE_WORKER=0 RISE_REWARD_GPU_OFFSET=0 RISE_REWARD_SERVERS="${NUM_SERVERS}" \
   bash vllm_service_init/start.sh "${BASE_MODEL}" "video_graph_build"
 
 python -m video_graph_builder.build_video_graph \
@@ -41,6 +42,10 @@ python -m video_graph_builder.build_video_graph \
   --base_port "${BASE_PORT}" \
   --fps "${RISE_VIDEO_GRAPH_FPS:-1.0}" \
   --min_segment_seconds "${RISE_VIDEO_GRAPH_MIN_SEGMENT_SECONDS:-1.0}" \
-  --num_montage_frames "${RISE_VIDEO_GRAPH_MONTAGE_FRAMES:-3}"
+  --num_montage_frames "${RISE_VIDEO_GRAPH_MONTAGE_FRAMES:-3}" \
+  --montage_frame_height "${RISE_VIDEO_GRAPH_MONTAGE_FRAME_HEIGHT:-360}" \
+  --videos_per_batch "${RISE_VIDEO_GRAPH_VIDEOS_PER_BATCH:-8}" \
+  --link_window_sec "${RISE_VIDEO_GRAPH_LINK_WINDOW_SEC:-10}" \
+  --max_reid_pairs "${RISE_VIDEO_GRAPH_MAX_REID_PAIRS:-2000}"
 
 echo "[build-video-graphs] done, graphs written to ${OUT_DIR}"
