@@ -1,17 +1,17 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 '''
-Refactored Version: This script employs the 'stopit' library to apply fine-grained, thread-safe
-timeout control directly to the `grade_answer` function. This approach is more robust than a
-global timeout and avoids the 'signal only works in main thread' error common in multi-threaded
-Flask applications. The comparison logic is optimized to perform cheap checks first.
+Reward / graph-building vLLM server.
 
-Setup Instructions:
-    # 1. Install the required library (note the change from previous versions)
-    pip install stopit
+Endpoints used by the questioner reward (train_examples/reward_function/cot_val.py):
+    /judge_validity  temperature-0 validity + category judge over the video graph
+    /hello           per-candidate Verifier sampling: for each query, every Planner
+                     candidate is judged G times, returning its consistency c_i
+Endpoints used by video_graph_builder: /caption_entities, /same_entity.
 
-    # 2. Run the server
-    python your_server_file_name.py --port 5000 --model_path Qwen/Qwen3-4B-Base
+Prompts are shared with question_evaluate/evaluate.py via video_verifier.prompts.
+
+    python start_vllm_server.py --port 5000 --model_path Qwen/Qwen3-4B-Base
 '''
 
 from flask import Flask, request, jsonify
@@ -23,17 +23,36 @@ import sys
 import threading
 import time
 import torch
-import re
 from transformers import AutoTokenizer
-from mathruler.grader import extract_boxed_content, grade_answer
-import stopit  # 1. Import the thread-safe 'stopit' library
 import base64
 import io
 from PIL import Image
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from verl.utils.vllm_utils import VLLMHijack
+from video_graph_builder.montage import stack_montages
 from video_graph_builder.parsing import parse_caption_entities
+from frozen_planner.planner import plan
+from video_verifier.prompts import (
+    build_candidate_problem,
+    build_candidate_prompt,
+    build_graph_context,
+    build_validity_prompt,
+    candidate_image,
+    evenly_spaced,
+    extract_category_match,
+    load_graph,
+    normalize_category,
+    parse_binary,
+    tally_votes,
+)
+
+# /hello judges at most this many candidates per query (evenly spaced over C(x, q)).
+MAX_CANDIDATES = int(os.getenv("RISE_MAX_CANDIDATES", "64"))
+# /judge_validity lists at most this many timeline segments in the graph context.
+MAX_CONTEXT_SEGMENTS = int(os.getenv("RISE_MAX_CONTEXT_SEGMENTS", "120"))
+CANDIDATE_MAX_PIXELS = int(os.getenv("RISE_CANDIDATE_MAX_PIXELS", "2097152"))
+CANDIDATE_MIN_PIXELS = int(os.getenv("RISE_CANDIDATE_MIN_PIXELS", "262144"))
 # ------------------------- Command-Line Arguments ------------------------- #
 # (This section remains unchanged)
 parser = argparse.ArgumentParser()
@@ -59,6 +78,7 @@ args = parser.parse_args()
 # (This section remains unchanged)
 print('[init] Loading model...')
 
+# See VLLMHijack.hijack() for the RISE_FORCE_VIT_SDPA vision-tower attention patch.
 VLLMHijack.hijack()
 tokenizer = AutoTokenizer.from_pretrained(args.model_path)
 model = vllm.LLM(
@@ -68,6 +88,9 @@ model = vllm.LLM(
     max_model_len=args.max_model_len,
     disable_mm_preprocessor_cache=True,
     enable_prefix_caching=False,
+    # Every endpoint sends exactly one image and never video; without this
+    # vLLM profiles the encoder with a maximum-size video at startup.
+    limit_mm_per_prompt={"image": 1, "video": 0},
 )
 
 sample_params = vllm.SamplingParams(
@@ -76,7 +99,7 @@ sample_params = vllm.SamplingParams(
     top_p=1.0,
     top_k=40,
     stop_token_ids=[tokenizer.eos_token_id],
-    n=10, # Generate 10 candidate answers for each question
+    n=10, # G: Verifier judgments sampled per candidate
 )
 
 judge_sample_params = vllm.SamplingParams(
@@ -131,73 +154,14 @@ def gpu_idle_worker():
             time.sleep(1)
     print('[idle_worker] GPU idle worker stopped.')
 
+# RISE_GPU_IDLE_WORKER=0 turns the idle worker off, e.g. for graph building,
+# where the builder's own DINOv2/RAFT pass shares GPU 0 with a server.
 idle_thread = threading.Thread(target=gpu_idle_worker, daemon=True)
-idle_thread.start()
+if os.getenv("RISE_GPU_IDLE_WORKER", "1") == "1":
+    idle_thread.start()
+else:
+    print('[idle_worker] disabled (RISE_GPU_IDLE_WORKER=0).')
 generation_lock = threading.Lock()
-
-ALLOWED_SKILLS = [
-    "coarse perception",
-    "fine-grained perception",
-    "instance reasoning",
-    "logical reasoning",
-    "math & counting",
-    "science & technology",
-]
-SKILL_ALIASES = {
-    "coarse perception": "coarse perception",
-    "fine grained perception": "fine-grained perception",
-    "fine-grained perception": "fine-grained perception",
-    "instance reasoning": "instance reasoning",
-    "logical reasoning": "logical reasoning",
-    "math": "math & counting",
-    "math & counting": "math & counting",
-    "math and counting": "math & counting",
-    "science & technology": "science & technology",
-    "science and technology": "science & technology",
-}
-SKILL_CONTEXTS = {
-    "coarse perception": (
-        "Skill definition for `coarse perception`:\n"
-        "Allowed: overall scene type, main objects, global layout, salient entity presence, broad visual category recognition.\n"
-        "Forbidden: any question whose primary solution relies on counting, estimating quantity, totaling, or approximating numbers.\n"
-    ),
-    "fine-grained perception": (
-        "Skill definition for `fine-grained perception`:\n"
-        "Allowed: local details, subtle visual attributes, textures, small text, fine-grained category differences, small part recognition.\n"
-        "Forbidden: counting small parts, estimating the number of segments/pieces/regions, or any quantity-focused question.\n"
-    ),
-    "instance reasoning": (
-        "Skill definition for `instance reasoning`:\n"
-        "Allowed: comparing instances, identifying relations between instances, attribute binding, matching an attribute to the correct instance.\n"
-        "Forbidden: solving mainly by counting instances or estimating how many instances satisfy a condition.\n"
-    ),
-    "logical reasoning": (
-        "Skill definition for `logical reasoning`:\n"
-        "Allowed: multi-step visual deduction, elimination, conditional reasoning, combining multiple visual cues to infer a conclusion.\n"
-        "Forbidden: questions whose main reasoning path is counting, estimation, arithmetic, or quantity aggregation.\n"
-    ),
-    "math & counting": (
-        "Skill definition for `math & counting`:\n"
-        "Allowed: counting, estimation, arithmetic, geometric or numerical reasoning, approximate quantity judgment.\n"
-    ),
-    "science & technology": (
-        "Skill definition for `science & technology`:\n"
-        "Allowed: diagrams, charts, scientific illustrations, technical structures, instrument or figure understanding.\n"
-        "Forbidden: if the question is mainly about counting parts or estimating quantities, it should not be labeled as this skill.\n"
-    ),
-}
-
-# ------------------------ Timeout Utility (Refactored) --------------------------- #
-# 2. Use the 'stopit.threading_timeoutable' decorator for thread-safe timeouts.
-#    It returns a default value on timeout instead of raising an exception.
-@stopit.threading_timeoutable(default='TIMED_OUT')
-def grade_answer_with_timeout(res1, res2):
-    """
-    This wrapper applies a timeout to each individual `grade_answer` call.
-    If the function's execution exceeds the specified timeout, it will return 'TIMED_OUT'.
-    The timeout duration is passed as a keyword argument during the function call.
-    """
-    return grade_answer(res1, res2)
 
 # ---------------------------- Flask Application --------------------------- #
 app = Flask(__name__)
@@ -218,75 +182,7 @@ def base64_to_pil(b64_string):
 
 
 def extract_boxed_binary(text):
-    boxed = extract_boxed_content(text or "")
-    if boxed is None:
-        return 0
-    normalized = str(boxed).strip().lower()
-    if normalized in {"1", "yes", "true", "valid", "correct"}:
-        return 1
-    if normalized in {"0", "no", "false", "invalid", "incorrect"}:
-        return 0
-    return 0
-
-
-def normalize_skill_label(skill):
-    if skill is None:
-        return None
-    normalized = str(skill).strip().lower().replace("_", " ").replace("-", " ")
-    normalized = " ".join(normalized.split())
-    return SKILL_ALIASES.get(normalized)
-
-
-def get_skill_context(declared_skill):
-    normalized = normalize_skill_label(declared_skill)
-    if normalized in SKILL_CONTEXTS:
-        return SKILL_CONTEXTS[normalized]
-    return (
-        "Skill definition unavailable because the declared skill is not one of the six valid classes.\n"
-    )
-
-
-def extract_skill_match(text, final_valid):
-    if not text:
-        return final_valid
-    patterns = [
-        r"skill\s*match\s*[:：]\s*([01])",
-        r"declared\s*skill\s*correct\s*[:：]\s*([01])",
-        r"skill\s*is\s*correct\s*[:：]\s*([01])",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return int(match.group(1))
-    return final_valid
-
-
-def build_validity_chat(question, img, declared_skill):
-    skill_context = get_skill_context(declared_skill)
-    prompt = (
-        "<|im_start|>system\n"
-        "You are a strict visual question validity judge. "
-        "Only decide whether the question can be answered solely from the provided image and whether the declared skill matches the question. "
-        "Do not solve the question. "
-        "Use the following skill definition and restriction for the declared skill when judging skill correctness:\n"
-        f"{skill_context}"
-        "You may first give a brief reason, then you must output a line in the form 'Skill Match: 1' or 'Skill Match: 0'. "
-        "Finally, you must put the final decision inside \\boxed{} exactly once at the end. "
-        "Output \\boxed{1} only if the question is image-grounded, well-posed, answerable from the image alone, and the declared skill is correct. "
-        "Output \\boxed{0} otherwise.\n"
-        "<|im_end|>\n"
-        "<|im_start|>user\n"
-        "<|vision_start|><|image_pad|><|vision_end|>"
-        f"Question: {question}\n"
-        f"Declared Skill: {declared_skill}\n"
-        "The only valid skill classes are: coarse perception; fine-grained perception; instance reasoning; logical reasoning; math & counting; science & technology.\n"
-        "Judge whether this question is image-grounded, well-posed, and answerable from the image alone, and whether the declared skill matches the question. "
-        "If either condition fails, output \\boxed{0}. Do not solve the question. "
-        "You may briefly explain why, then output 'Skill Match: 1' or 'Skill Match: 0', and end with \\boxed{1} or \\boxed{0}.\n"
-        "<|im_end|>\n"
-        "<|im_start|>assistant\n"
-    )
-    return {"prompt": prompt, "multi_modal_data": {"image": img}}
+    return parse_binary(text) or 0
 
 
 def build_caption_entities_chat(montage_img):
@@ -308,19 +204,6 @@ def build_caption_entities_chat(montage_img):
         "<|im_start|>assistant\n"
     )
     return {"prompt": prompt, "multi_modal_data": {"image": montage_img}}
-
-
-def process_validity_single(question, declared_skill, response):
-    raw_text = response.outputs[0].text if response.outputs else ""
-    valid = extract_boxed_binary(raw_text)
-    skill_match = extract_skill_match(raw_text, final_valid=valid)
-    return {
-        "question": question,
-        "declared_skill": declared_skill,
-        "skill_match": skill_match,
-        "valid": valid,
-        "reason": raw_text.strip(),
-    }
 
 
 def engine_is_dead(exc: Exception) -> bool:
@@ -389,7 +272,10 @@ def generate_with_fallback(name, batch_name, prompts, sampling_params, batch_ite
 
 @app.route('/hello', methods=['GET'])
 def hello():
-    '''The main processing endpoint: reads a task file, invokes vLLM, consolidates answers, and writes results.'''
+    '''Questioner difficulty signal: for each query, the Planner enumerates C(x, q),
+    each candidate is judged G times, and the per-candidate consistency c_i
+    (fraction of parseable judgments that accept) is returned as candidate_scores.
+    cot_val.py turns these into d(x, q).'''
 
     # --- Pause the GPU idle worker to free up resources ---
     pause_event.set()
@@ -398,174 +284,64 @@ def hello():
     name = request.args.get('name', 'None')
     print(f'[server] Received request for task file: {name}')
 
-    # ---------- Load Data ----------
     with open(name, 'r') as f:
         data = json.load(f)
     os.remove(name)
 
-    questions = [item.get('question', '') for item in data]
-    answers   = [item.get('answer',   '') for item in data]
-    types     = [item.get('types',    '') for item in data]
-    image     = [item.get('image',    '') for item in data]
-
-    # Convert image list.
-    pil_images = []
-    for img_b64 in image:
-        if img_b64:
-            try:
-                pil_images.append(base64_to_pil(img_b64))
-            except Exception as e:
-                print(f"[warning] Image decode failed: {e}")
-                pil_images.append(None)
-        else:
-            pil_images.append(None)
-
-    # (Data preparation logic remains unchanged)
-    valid_chats = []
-    valid_chat_items = []
-    valid_indices = []
-    for i, (q, a, t, img) in enumerate(zip(questions, answers, types, pil_images)):
-        if q and a and t and img:
-            prompt = (
-                "<|im_start|>system\n"
-                "You are an AI visual question answering assistant. "
-                "Answer questions based only on the visual content provided. "
-                "You **must only output your final answer inside \\boxed{}**. "
-                "Do not write explanations or any other text.\n"
-                "<|im_end|>\n"
-                f"<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
-                f"This is a question: {q}.\n"
-                "**IMPORTANT:** Only output your answer in the form \\boxed{{answer}}.Do NOT include any units; provide only the numeric value or option.\n"
-                "<|im_end|>\n"
-                "<|im_start|>assistant\n"
-            )
-
-            valid_chats.append({
-                "prompt": prompt,
-                "multi_modal_data": {"image": img}
-            })
-            valid_chat_items.append({
-                "prompt_index": i,
-                "question": q,
-                "answer": a,
-                "type": t,
-                "image_size": {"width": img.width, "height": img.height},
-            })
-            valid_indices.append(i)
-    print('[server] Valid chat prompts have been prepared.')
-
-    # ---------- vLLM Generation ----------
-    # (vLLM generation logic remains unchanged)
-
-    responses = []
-    with generation_lock:
-        responses = generate_with_fallback(
-            name,
-            "hello",
-            valid_chats,
-            sample_params,
-            valid_chat_items,
-            use_tqdm=True,
-        )
-
-
-    print('[server] Generation completed.')
-
-    # ---------- Results Post-Processing (Core Refactoring & Optimization Here) ----------
-    def process_single(question, golden_answer, response):
-        '''Consolidates and grades vLLM outputs for a single question, returning a result dictionary.'''
-        results = [extract_boxed_content(out.text) for out in response.outputs]
-        # print(f"[process_single] Processing question: '{question[:70]}...'")
-
-        answer_counts = {}
-        for res in results:
-            if not res: continue # Skip empty results
-            matched = False
-            
-            for exist_ans in list(answer_counts.keys()):
-                # 3. OPTIMIZATION: Perform cheap comparisons first to avoid expensive calls.
-                if res == exist_ans or ('no ' in res.lower() and 'no ' in exist_ans.lower()):
-                    answer_counts[exist_ans] += 1
-                    matched = True
-                    break # Match found, break from the inner loop over exist_ans
-                
-                # 4. If cheap checks fail, proceed to the expensive, timed grade_answer calls.
-                try:
-                    is_match = False
-                    # First direction: res vs exist_ans
-                    match_result_1 = grade_answer_with_timeout(res, exist_ans, timeout=10)
-                    if match_result_1 == 'TIMED_OUT':
-                        print(f"      [grader] TIMEOUT comparing '{res[:30]}...' with '{exist_ans[:30]}...'.")
-                    elif match_result_1:
-                        is_match = True
-
-                    # Second direction (only if first failed): exist_ans vs res
-                    if not is_match:
-                        match_result_2 = grade_answer_with_timeout(exist_ans, res, timeout=10)
-                        if match_result_2 == 'TIMED_OUT':
-                             # Log timeout for the second direction as well
-                            print(f"      [grader] TIMEOUT comparing '{exist_ans[:30]}...' with '{res[:30]}...'. Skipping pair.")
-                        elif match_result_2:
-                            is_match = True
-                    
-                    if is_match:
-                        answer_counts[exist_ans] += 1
-                        matched = True
-                        break # Match found, break from the inner loop
-
-                except Exception as e:
-                    # Catch any other potential errors from the grader function itself.
-                    print(f"      [grader] ERROR comparing '{res[:30]}...' with '{exist_ans[:30]}...': {e}. Skipping.")
-                    continue # Continue to the next comparison in the inner loop
-            
-            if not matched:
-                answer_counts[res] = 1
-
-        if not answer_counts:
-            majority_ans, max_count = '', 0
-        else:
-            majority_ans = max(answer_counts, key=answer_counts.get)
-            max_count = answer_counts[majority_ans]
-
-        score = max_count / len(results) if results else 0.0
-
-        return {
-            'question': question,
-            'answer':   majority_ans,
-            'score':    score,
-            'results':  results
-        }
-
     results_all = [
         {
-            'question': q,
-            'answer': a,
-            'score': -1,
-            'results': [],
-            'reason': 'missing question, answer, type, or image',
+            'question': item.get('question', ''),
+            'candidate_scores': [],
+            'num_candidates': 0,
+            'reason': '',
         }
-        for q, a in zip(questions, answers)
+        for item in data
     ]
-    for idx, response in zip(valid_indices, responses):
-        q = questions[idx]
-        a = answers[idx]
+    chats, chat_items, owners = [], [], []
+    for idx, item in enumerate(data):
+        question = item.get('question', '')
+        category = normalize_category(item.get('declared_category'))
+        if not question or category is None:
+            results_all[idx]['reason'] = 'missing question or unknown category'
+            continue
         try:
-            if response is None:
-                raise RuntimeError("generation failed for this prompt")
-            item = process_single(q, a, response)
-            item['reason'] = ''
-            results_all[idx] = item
+            graph = load_graph(item.get('graph_path', ''))
+            candidates = plan(graph, {'category': category, 'time_bounds': item.get('time_bounds')})
         except Exception as e:
-            # Catch any other unexpected exceptions from within process_single.
-            print(f'[server] CRITICAL: An unhandled error occurred while processing question: {q}')
-            print(f'[server] Error details: {e}')
-            results_all[idx] = {
-                'question': q,
-                'answer':   a,
-                'score':    -1,
-                'results':  [],
-                'error':    f'unhandled exception in process_single: {str(e)}'
-            }
+            results_all[idx]['reason'] = f'planning failed: {e}'
+            continue
+        candidates = evenly_spaced(candidates, MAX_CANDIDATES)
+        results_all[idx]['num_candidates'] = len(candidates)
+        for candidate in candidates:
+            try:
+                image = candidate_image(
+                    item['graph_path'], graph, candidate,
+                    max_pixels=CANDIDATE_MAX_PIXELS, min_pixels=CANDIDATE_MIN_PIXELS,
+                )
+            except Exception as e:
+                print(f"[server][warning] skipping candidate {candidate['candidate_id']}: {e}")
+                continue
+            problem = build_candidate_problem(question, candidate, graph)
+            chats.append({'prompt': build_candidate_prompt(problem), 'multi_modal_data': {'image': image}})
+            chat_items.append({
+                'prompt_index': len(chat_items),
+                'question': question,
+                'candidate_id': candidate['candidate_id'],
+                'image_size': {'width': image.width, 'height': image.height},
+            })
+            owners.append(idx)
+    print(f'[server] Prepared {len(chats)} candidate prompts for {len(data)} queries.')
+
+    with generation_lock:
+        responses = generate_with_fallback(name, 'hello', chats, sample_params, chat_items, use_tqdm=True)
+    print('[server] Generation completed.')
+
+    for idx, response in zip(owners, responses):
+        if response is None:
+            continue
+        _, consistency = tally_votes([out.text for out in response.outputs])
+        if consistency is not None:
+            results_all[idx]['candidate_scores'].append(consistency)
     print('[server] All results have been processed.')
 
     out_path = name.replace('.json', '_results.json')
@@ -580,6 +356,8 @@ def hello():
 
 @app.route('/judge_validity', methods=['GET'])
 def judge_validity():
+    '''Query validity: structural checks (known category, graph loads, the Planner
+    finds candidates), then a temperature-0 judge over the graph's text view.'''
     pause_event.set()
     torch.cuda.synchronize()
 
@@ -590,45 +368,37 @@ def judge_validity():
         data = json.load(f)
     os.remove(name)
 
-    questions = [item.get('question', '') for item in data]
-    declared_skills = [normalize_skill_label(item.get('declared_skill')) or item.get('declared_skill', 'unknown') for item in data]
-    images = [item.get('image', '') for item in data]
-
-    pil_images = []
-    for img_b64 in images:
-        if img_b64:
-            try:
-                pil_images.append(base64_to_pil(img_b64))
-            except Exception as e:
-                print(f"[warning] Image decode failed in validity judge: {e}")
-                pil_images.append(None)
-        else:
-            pil_images.append(None)
-
-    valid_chats = []
-    valid_chat_items = []
-    valid_indices = []
-    results_all = [
-        {
-            'question': q,
-            'declared_skill': declared_skill,
-            'skill_match': 0,
+    results_all = []
+    valid_chats, valid_chat_items, valid_indices = [], [], []
+    for idx, item in enumerate(data):
+        question = item.get('question', '')
+        category = normalize_category(item.get('declared_category'))
+        result = {
+            'question': question,
+            'declared_category': category or item.get('declared_category', 'unknown'),
+            'category_match': 0,
             'valid': 0,
-            'reason': 'missing question, image, or declared skill',
+            'reason': '',
         }
-        for q, declared_skill in zip(questions, declared_skills)
-    ]
-
-    for idx, (q, img, declared_skill) in enumerate(zip(questions, pil_images, declared_skills)):
-        if q and img and normalize_skill_label(declared_skill):
-            valid_chats.append(build_validity_chat(q, img, declared_skill))
-            valid_chat_items.append({
-                "prompt_index": idx,
-                "question": q,
-                "declared_skill": declared_skill,
-                "image_size": {"width": img.width, "height": img.height},
-            })
-            valid_indices.append(idx)
+        results_all.append(result)
+        if not question or category is None:
+            result['reason'] = 'missing question or unknown category'
+            continue
+        try:
+            graph = load_graph(item.get('graph_path', ''))
+            if not plan(graph, {'category': category, 'time_bounds': item.get('time_bounds')}):
+                result['reason'] = 'no candidates'
+                continue
+        except Exception as e:
+            result['reason'] = f'planning failed: {e}'
+            continue
+        valid_chats.append({
+            'prompt': build_validity_prompt(
+                question, category, item.get('time_bounds'), build_graph_context(graph, MAX_CONTEXT_SEGMENTS)
+            ),
+        })
+        valid_chat_items.append({'prompt_index': idx, 'question': question, 'declared_category': category})
+        valid_indices.append(idx)
 
     if valid_chats:
         with generation_lock:
@@ -645,16 +415,14 @@ def judge_validity():
             raw_text = response.outputs[0].text if response.outputs else ""
             print(f"[server][validity-debug-{debug_idx}] {raw_text}")
         for idx, response in zip(valid_indices, responses):
-            if response is not None:
-                results_all[idx] = process_validity_single(questions[idx], declared_skills[idx], response)
-            else:
-                results_all[idx] = {
-                    "question": questions[idx],
-                    "declared_skill": declared_skills[idx],
-                    "skill_match": 0,
-                    "valid": 0,
-                    "reason": "generation failed",
-                }
+            if response is None:
+                results_all[idx]['reason'] = 'generation failed'
+                continue
+            raw_text = response.outputs[0].text if response.outputs else ""
+            valid = parse_binary(raw_text) or 0
+            results_all[idx]['valid'] = valid
+            results_all[idx]['category_match'] = extract_category_match(raw_text, final_valid=valid)
+            results_all[idx]['reason'] = raw_text.strip()
 
     out_path = name.replace('.json', '_results.json')
     with open(out_path, 'w') as f:
@@ -664,6 +432,35 @@ def judge_validity():
     print(f'[server] Processed validity {name}, results saved to {out_path}. Resuming idle worker.')
     return jsonify({'message': f'Processed validity {name}, results saved to {out_path}.'})
 
+
+def _describe_mention(mention):
+    name = str(mention.get("name", "")).strip() or "unnamed"
+    description = str(mention.get("description", "")).strip()
+    kind = str(mention.get("type", "")).strip()
+    return f"{name} ({kind})" + (f": {description}" if description else "")
+
+
+def build_same_entity_chat(pair_img, mention_a, mention_b):
+    prompt = (
+        "<|im_start|>system\n"
+        "You are a strict video entity re-identification judge. You are shown one image with two "
+        "labelled strips: Segment A on top and Segment B below, each a few frames from a short video "
+        "segment, left = earliest. Decide whether the entity described in Segment A and the entity "
+        "described in Segment B are the same individual -- the same physical person, animal or "
+        "object instance -- not merely the same kind of thing. Judge from what you see: appearance "
+        "(color, markings, clothing, distinctive features) must be consistent. Ignore changes in "
+        "position, pose, scale, lighting, background and the wording of the descriptions.\n"
+        "<|im_end|>\n"
+        "<|im_start|>user\n"
+        "<|vision_start|><|image_pad|><|vision_end|>"
+        f"Entity in Segment A: {_describe_mention(mention_a)}\n"
+        f"Entity in Segment B: {_describe_mention(mention_b)}\n"
+        "In one short sentence compare their appearance, then end with \\boxed{1} if they are the "
+        "same individual or \\boxed{0} if they are not.\n"
+        "<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+    return {"prompt": prompt, "multi_modal_data": {"image": pair_img}}
 
 @app.route('/caption_entities', methods=['GET'])
 def caption_entities():
@@ -750,6 +547,75 @@ def caption_entities():
     print(f'[server] Processed caption_entities {name}, results saved to {out_path}. Resuming idle worker.')
     return jsonify({'message': f'Processed caption_entities {name}, results saved to {out_path}.'})
 
+
+@app.route('/same_entity', methods=['GET'])
+def same_entity():
+    pause_event.set()
+    torch.cuda.synchronize()
+
+    name = request.args.get('name', 'None')
+    print(f'[server] Received same_entity request for task file: {name}')
+
+    with open(name, 'r') as f:
+        data = json.load(f)
+    os.remove(name)
+
+    montages = {}
+    for segment_id, img_b64 in data.get('montages', {}).items():
+        try:
+            montages[segment_id] = base64_to_pil(img_b64)
+        except Exception as e:
+            print(f"[warning] Image decode failed in same_entity for {segment_id}: {e}")
+            montages[segment_id] = None
+
+    pairs = data.get('pairs', [])
+    results_all = [
+        {'pair_id': pair.get('pair_id', ''), 'same': 0, 'reason': 'missing montage'}
+        for pair in pairs
+    ]
+
+    valid_chats = []
+    valid_chat_items = []
+    valid_indices = []
+    for idx, pair in enumerate(pairs):
+        img_a = montages.get(pair.get('segment_a'))
+        img_b = montages.get(pair.get('segment_b'))
+        if img_a and img_b:
+            valid_chats.append(build_same_entity_chat(
+                stack_montages(img_a, img_b), pair.get('mention_a', {}), pair.get('mention_b', {}),
+            ))
+            valid_chat_items.append({"prompt_index": idx, "pair_id": pair.get('pair_id', '')})
+            valid_indices.append(idx)
+
+    if valid_chats:
+        with generation_lock:
+            responses = generate_with_fallback(
+                name,
+                "same_entity",
+                valid_chats,
+                judge_sample_params,
+                valid_chat_items,
+                use_tqdm=True,
+            )
+        for idx, response in zip(valid_indices, responses):
+            if response is not None:
+                raw_text = response.outputs[0].text if response.outputs else ""
+                results_all[idx] = {
+                    "pair_id": pairs[idx].get('pair_id', ''),
+                    "same": extract_boxed_binary(raw_text),
+                    "reason": raw_text.strip(),
+                }
+            else:
+                results_all[idx]["reason"] = "generation failed"
+
+    out_path = name.replace('.json', '_results.json')
+    with open(out_path, 'w') as f:
+        json.dump(results_all, f, indent=4)
+
+    pause_event.clear()
+    print(f'[server] Processed same_entity {name}, results saved to {out_path}. Resuming idle worker.')
+    return jsonify({'message': f'Processed same_entity {name}, results saved to {out_path}.'})
+
 # ------------------------- Main Application Entrypoint --------------------------- #
 # (This section remains unchanged)
 if __name__ == '__main__':
@@ -758,5 +624,6 @@ if __name__ == '__main__':
     finally:
         # Gracefully shut down the background thread on exit
         stop_event.set()
-        idle_thread.join()
+        if idle_thread.is_alive():
+            idle_thread.join()
         print('[main] Application shutdown complete.')

@@ -17,12 +17,12 @@ This reward function is for regular [CoT] -> [Answer] GRPO finetuning
 '''
 
 from typing import Dict, List, Optional
-from mathruler.grader import extract_boxed_content, grade_answer
+from mathruler.grader import extract_boxed_content
 
 
 def format_reward(predict: str) -> float:
     answer = extract_boxed_content(predict)
-    return 0.0 if answer else -1
+    return 0.0 if answer and answer != "None" else -1
 
 def extract_description(predict: str) -> Optional[str]:
     """
@@ -62,11 +62,31 @@ def extract_boxed_answer(predict: str) -> Optional[str]:
     return match.group(1).strip()
 
 
+_POSITIVE = {"yes", "accept", "accepted", "true", "1"}
+_NEGATIVE = {"no", "reject", "rejected", "false", "0"}
+
+
+def normalize_verdict(text) -> Optional[bool]:
+    """Binary Verifier verdict -> True/False, or None if it isn't one."""
+    token = str(text).strip().strip(".").lower()
+    if token in _POSITIVE:
+        return True
+    if token in _NEGATIVE:
+        return False
+    return None
+
+
 def accuracy_reward(predict: str, ground_truth: str) -> float:
+    """1.0 iff the boxed verdict matches the candidate's majority-vote
+    pseudo-label ŷ_i (passed in as ground_truth)."""
     answer = extract_boxed_content(predict)
     if not answer:
         return 0.0
-    return 1.0 if grade_answer(answer, ground_truth) else 0.0
+    verdict = normalize_verdict(answer)
+    pseudo_label = normalize_verdict(ground_truth)
+    if verdict is None or pseudo_label is None:
+        return 0.0
+    return 1.0 if verdict == pseudo_label else 0.0
 
 
 def compute_score(predicts: List[str], ground_truths: List[str], questions: List[str], description_answers: List[str], format_weight: float = 0.1) -> List[Dict[str, float]]:

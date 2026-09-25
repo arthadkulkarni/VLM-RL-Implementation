@@ -115,9 +115,15 @@ def build_sample_indices(total_samples, start_index, num_samples, suffix):
         return [], "empty"
 
     if start_index < total_samples:
-        end_index = min(total_samples, start_index + requested)
-        print(f"Using contiguous slice [{start_index}, {end_index}) from dataset of size {total_samples}")
-        return list(range(start_index, end_index)), "slice"
+        # Wrap around rather than truncating at the end of the graph list, so a
+        # small graph pool (e.g. the mini run's single graph) still yields
+        # num_samples questions -- each a fresh temperature-1.0 sample.
+        end_index = start_index + requested
+        print(
+            f"Using contiguous slice [{start_index}, {end_index}) (wrapping) "
+            f"from dataset of size {total_samples}"
+        )
+        return [i % total_samples for i in range(start_index, end_index)], "slice"
 
     seed_material = f"{QUESTION_GENERATE_SHUFFLE_SEED}:{start_index}:{suffix}"
     rng = random.Random(seed_material)

@@ -4,7 +4,15 @@ set -euo pipefail
 model_path=$1
 run_id=$2
 pgid_file="${VLLM_SERVER_PGID_FILE:-/tmp/${USER}/visplay_vllm_server_pgids_default}"
-export VLLM_DISABLE_COMPILE_CACHE=1
+# vLLM compile cache: torch.compile takes ~3 min per server start and only
+# depends on the architecture + vLLM config, not the weights, so alternating
+# checkpoints reuse it. One cache root per GPU slot keeps the servers that
+# start together from writing the same cache files. RISE_VLLM_COMPILE_CACHE=0
+# restores the old always-recompile behaviour.
+vllm_cache_base="${RISE_VLLM_CACHE_DIR:-${HOME}/.cache/vllm_rise}"
+if [ "${RISE_VLLM_COMPILE_CACHE:-1}" != "1" ]; then
+  export VLLM_DISABLE_COMPILE_CACHE=1
+fi
 vllm_server_max_model_len="${VLLM_SERVER_MAX_MODEL_LEN:-12288}"
 vllm_server_gpu_mem_util="${VLLM_SERVER_GPU_MEM_UTIL:-0.8}"
 vllm_server_log_dir="${VLLM_SERVER_LOG_DIR:-${STORAGE_PATH:-../storage_vllm}/temp_results}"
@@ -21,7 +29,8 @@ start_one_server() {
   local log_file="${vllm_server_log_dir}/vllm_server_${port}.log"
   local pgid=""
   echo "[vllm-start] launching port=${port} cuda=${cuda_id} log=${log_file}"
-  setsid env CUDA_VISIBLE_DEVICES="$cuda_id" python vllm_service_init/start_vllm_server.py \
+  setsid env CUDA_VISIBLE_DEVICES="$cuda_id" VLLM_CACHE_ROOT="${vllm_cache_base}/server_gpu${cuda_id}" \
+    python vllm_service_init/start_vllm_server.py \
     --port "$port" \
     --model_path "$model_path" \
     --max_model_len "$vllm_server_max_model_len" \
