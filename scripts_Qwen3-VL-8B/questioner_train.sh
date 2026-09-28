@@ -114,7 +114,9 @@ trainer_args=(
   "trainer.save_freq=${train_steps}"
   "trainer.experiment_name=${experiment_name}"
   "trainer.save_checkpoint_path=${model_save_root}/${experiment_name}"
-  trainer.total_epochs=1
+  # max_steps is the real stop condition; enough epochs guarantee a small
+  # (e.g. 1-batch) dataloader still reaches it instead of ending early.
+  "trainer.total_epochs=${train_steps}"
 
   # The questioner is trained on the low GPU IDs while solver reward servers use the
   # remaining GPU IDs on the same node (see GPU split above).
@@ -130,8 +132,21 @@ fi
 echo "Training questioner..."
 CUDA_VISIBLE_DEVICES="${train_cuda_devices}" python3 -m verl.trainer.main "${trainer_args[@]}"
 
-step_dir="${model_save_root}/${experiment_name}/global_step_${train_steps}"
+# Merge the step the trainer actually saved, which can differ from the
+# requested one if training ended early.
+latest_step_file="${model_save_root}/${experiment_name}/latest_global_step.txt"
+if [ ! -f "${latest_step_file}" ]; then
+  echo "ERROR: questioner trainer saved no checkpoint (missing ${latest_step_file})" >&2
+  exit 1
+fi
+saved_step="$(tr -d '[:space:]' < "${latest_step_file}")"
+step_dir="${model_save_root}/${experiment_name}/global_step_${saved_step}"
 python scripts_Qwen3-VL-8B/model_merger.py --local_dir "${step_dir}/actor"
+
+if [ "${saved_step}" != "${train_steps}" ]; then
+  echo "ERROR: questioner trainer stopped at global_step_${saved_step}, expected global_step_${train_steps}" >&2
+  exit 1
+fi
 
 if [ ! -f "${step_dir}/actor/huggingface/config.json" ]; then
   echo "ERROR: merged questioner checkpoint is incomplete: ${step_dir}/actor/huggingface" >&2

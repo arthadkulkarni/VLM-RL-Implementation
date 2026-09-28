@@ -117,7 +117,9 @@ trainer_args=(
   worker.val_reward.reward_function=./train_examples/reward_function/cot_val_solver.py:compute_score
 
   "trainer.project_name=${PROJECT_NAME:-RISE}"
-  trainer.total_epochs=1
+  # max_steps is the real stop condition; enough epochs guarantee a small
+  # (e.g. 1-batch) dataloader still reaches it instead of ending early.
+  "trainer.total_epochs=${train_steps}"
   "trainer.max_steps=${train_steps}"
   "trainer.save_freq=${train_steps}"
   "trainer.experiment_name=${experiment_name}"
@@ -134,8 +136,21 @@ fi
 echo "Training solver..."
 python3 -m verl.trainer.main "${trainer_args[@]}"
 
-step_dir="${model_save_root}/${experiment_name}/global_step_${train_steps}"
+# Merge the step the trainer actually saved, which can differ from the
+# requested one if training ended early.
+latest_step_file="${model_save_root}/${experiment_name}/latest_global_step.txt"
+if [ ! -f "${latest_step_file}" ]; then
+  echo "ERROR: solver trainer saved no checkpoint (missing ${latest_step_file})" >&2
+  exit 1
+fi
+saved_step="$(tr -d '[:space:]' < "${latest_step_file}")"
+step_dir="${model_save_root}/${experiment_name}/global_step_${saved_step}"
 python scripts_Qwen3-VL-8B/model_merger.py --local_dir "${step_dir}/actor"
+
+if [ "${saved_step}" != "${train_steps}" ]; then
+  echo "ERROR: solver trainer stopped at global_step_${saved_step}, expected global_step_${train_steps}" >&2
+  exit 1
+fi
 
 if [ ! -f "${step_dir}/actor/huggingface/config.json" ]; then
   echo "ERROR: merged solver checkpoint is incomplete: ${step_dir}/actor/huggingface" >&2
