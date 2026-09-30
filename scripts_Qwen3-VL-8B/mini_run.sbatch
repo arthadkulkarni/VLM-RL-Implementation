@@ -31,8 +31,22 @@ mkdir -p logs/mini_run
 
 NVME_ROOT="${NVME_ROOT:-/work/nvme/bffz/akulkarni8/rise}"
 echo "=== $(date) starting on $(hostname), cpus=$(nproc) ==="
-source "${RISE_ENV_DIR:-${NVME_ROOT}/envs/RISE}/bin/activate"
-echo "python: $(command -v python)"
+# Don't `source bin/activate`: the nvme venv was copied from /work/hdd and its
+# activate script and bin/ shebangs still hardcode the hdd path. Sourcing it
+# put the hdd venv first on PATH, so the trainer and Ray's raylet/GCS imported
+# everything from /work/hdd and ray.init timed out (jobs 3246829, 3258420).
+# Putting the nvme bin/ on PATH directly makes python3 resolve to the nvme
+# symlink, whose pyvenv.cfg gives it the nvme site-packages.
+RISE_ENV_DIR="${RISE_ENV_DIR:-${NVME_ROOT}/envs/RISE}"
+export VIRTUAL_ENV="${RISE_ENV_DIR}"
+export PATH="${RISE_ENV_DIR}/bin:${PATH}"
+unset PYTHONHOME
+py_prefix="$(python3 -c 'import sys; print(sys.prefix)')"
+echo "python: $(command -v python3) (prefix ${py_prefix})"
+if [ "${py_prefix}" != "${RISE_ENV_DIR}" ]; then
+  echo "ERROR: python3 resolves to ${py_prefix}, expected ${RISE_ENV_DIR}" >&2
+  exit 1
+fi
 
 export PYTHONUNBUFFERED=1
 export MODEL_DIR="${MODEL_DIR:-${NVME_ROOT}/pretrained_LM}"
@@ -48,6 +62,11 @@ export RISE_ACTOR_PADDING_FREE="${RISE_ACTOR_PADDING_FREE:-false}"
 export RISE_FORCE_VIT_SDPA="${RISE_FORCE_VIT_SDPA:-1}"
 export RISE_NUM_GPUS="${RISE_NUM_GPUS:-4}"
 export RISE_RAY_NUM_CPUS="${RISE_RAY_NUM_CPUS:-16}"
+export RAY_raylet_start_wait_time_s="${RAY_raylet_start_wait_time_s:-300}"
+# Per-job Ray temp dir on node-local /tmp (Ray's socket paths must stay short),
+# copied next to the job log on exit so raylet/GCS errors survive the job.
+export RISE_RAY_TMPDIR="${RISE_RAY_TMPDIR:-/tmp/ray_${SLURM_JOB_ID:-$$}}"
+trap 'mkdir -p logs/mini_run/ray_${SLURM_JOB_ID:-$$} && cp -r "${RISE_RAY_TMPDIR}"/session_*/logs logs/mini_run/ray_${SLURM_JOB_ID:-$$}/ 2>/dev/null || true' EXIT
 
 export BIG_ROUNDS=1
 export MICRO_ITERS="${MICRO_ITERS:-2}"

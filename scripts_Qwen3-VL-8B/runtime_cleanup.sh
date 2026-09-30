@@ -59,7 +59,9 @@ wait_for_gpus_free() {
 runtime_cleanup_all() {
   echo "Stopping Ray and vLLM processes..."
 
-  command -v ray >/dev/null 2>&1 && ray stop --force >/dev/null 2>&1 || true
+  # Via the module, not the `ray` console script: that script's shebang can
+  # point at a different (copied-from) venv than the active python3.
+  python3 -m ray.scripts.scripts stop --force >/dev/null 2>&1 || true
 
   stop_vllm_server_groups
   wait_for_gpus_free

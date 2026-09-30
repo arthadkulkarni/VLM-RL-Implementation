@@ -128,7 +128,15 @@ def main():
         # ray/_private/worker.py's connect()). A training job here only needs a
         # couple of GPU actors, not hundreds of CPU workers, so cap it.
         ray_num_cpus = os.getenv("RISE_RAY_NUM_CPUS")
-        ray.init(runtime_env=runtime_env, num_cpus=int(ray_num_cpus) if ray_num_cpus else None)
+        # The dashboard is unused here and failed to start right before a raylet
+        # startup timeout (job 3258420); a per-job temp dir keeps that job's
+        # raylet/GCS logs apart from stale sessions so they can be inspected.
+        ray.init(
+            runtime_env=runtime_env,
+            num_cpus=int(ray_num_cpus) if ray_num_cpus else None,
+            include_dashboard=False,
+            _temp_dir=os.getenv("RISE_RAY_TMPDIR") or None,
+        )
 
     use_remote_runner = os.getenv("VERL_USE_REMOTE_RUNNER", "0") == "1"
     if use_remote_runner:
