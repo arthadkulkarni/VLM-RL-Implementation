@@ -31,22 +31,7 @@ mkdir -p logs/mini_run
 
 NVME_ROOT="${NVME_ROOT:-/work/nvme/bffz/akulkarni8/rise}"
 echo "=== $(date) starting on $(hostname), cpus=$(nproc) ==="
-# Don't `source bin/activate`: the nvme venv was copied from /work/hdd and its
-# activate script and bin/ shebangs still hardcode the hdd path. Sourcing it
-# put the hdd venv first on PATH, so the trainer and Ray's raylet/GCS imported
-# everything from /work/hdd and ray.init timed out (jobs 3246829, 3258420).
-# Putting the nvme bin/ on PATH directly makes python3 resolve to the nvme
-# symlink, whose pyvenv.cfg gives it the nvme site-packages.
-RISE_ENV_DIR="${RISE_ENV_DIR:-${NVME_ROOT}/envs/RISE}"
-export VIRTUAL_ENV="${RISE_ENV_DIR}"
-export PATH="${RISE_ENV_DIR}/bin:${PATH}"
-unset PYTHONHOME
-py_prefix="$(python3 -c 'import sys; print(sys.prefix)')"
-echo "python: $(command -v python3) (prefix ${py_prefix})"
-if [ "${py_prefix}" != "${RISE_ENV_DIR}" ]; then
-  echo "ERROR: python3 resolves to ${py_prefix}, expected ${RISE_ENV_DIR}" >&2
-  exit 1
-fi
+source scripts_Qwen3-VL-8B/use_env.sh
 
 export PYTHONUNBUFFERED=1
 export MODEL_DIR="${MODEL_DIR:-${NVME_ROOT}/pretrained_LM}"

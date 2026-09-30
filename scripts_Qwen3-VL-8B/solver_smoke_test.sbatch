@@ -25,7 +25,7 @@ mkdir -p logs/smoke_test
 echo "=== $(date) starting on $(hostname) ==="
 nvidia-smi --query-gpu=index,name,memory.total --format=csv
 
-source ../envs/RISE/bin/activate
+source scripts_Qwen3-VL-8B/use_env.sh
 
 export PYTHONUNBUFFERED=1
 

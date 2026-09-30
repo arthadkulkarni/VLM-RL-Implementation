@@ -24,7 +24,7 @@ cd "${REPO_ROOT}"
 mkdir -p logs/planner_smoke
 
 echo "=== $(date) starting on $(hostname) ==="
-source ../envs/RISE/bin/activate
+source scripts_Qwen3-VL-8B/use_env.sh
 
 export PYTHONUNBUFFERED=1
 # See VLLMHijack.hijack() in verl/utils/vllm_utils.py.

@@ -27,7 +27,7 @@ mkdir -p logs/smoke_test
 echo "=== $(date) starting on $(hostname) ==="
 nvidia-smi --query-gpu=index,name,memory.total --format=csv
 
-source ../envs/RISE/bin/activate
+source scripts_Qwen3-VL-8B/use_env.sh
 
 # Redirected stdout is block-buffered by default, which can hide 30+ minutes
 # of real progress behind silence in the log (as happened in job 3178940).

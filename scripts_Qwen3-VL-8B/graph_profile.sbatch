@@ -21,7 +21,7 @@ cd "${REPO_ROOT}"
 mkdir -p logs/graph_profile
 
 echo "=== $(date) starting on $(hostname), cpus=$(nproc) ==="
-source ../envs/RISE/bin/activate
+source scripts_Qwen3-VL-8B/use_env.sh
 
 export PYTHONUNBUFFERED=1
 # See VLLMHijack.hijack() in verl/utils/vllm_utils.py.
