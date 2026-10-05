@@ -18,6 +18,11 @@ export VIRTUAL_ENV="${RISE_ENV_DIR}"
 export PATH="${RISE_ENV_DIR}/bin:${PATH}"
 unset PYTHONHOME
 
+# The default login env puts the HPC SDK's NCCL 2.26.5 on LD_LIBRARY_PATH,
+# which shadows the venv's pip NCCL 2.27.3 and makes `import torch` fail with
+# "undefined symbol: ncclCommWindowRegister" (jobs 3298777, 3298782).
+export LD_LIBRARY_PATH="${RISE_ENV_DIR}/lib/python3.12/site-packages/nvidia/nccl/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+
 py_prefix="$(python3 -c 'import sys; print(sys.prefix)')"
 echo "python: $(command -v python3) (prefix ${py_prefix})"
 if [ "${py_prefix}" != "${RISE_ENV_DIR}" ]; then

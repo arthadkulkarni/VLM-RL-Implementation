@@ -38,11 +38,15 @@ start_one_server() {
     >"$log_file" 2>&1 &
   pgid=$!
   printf "%s\n" "${pgid}" >> "${pgid_file}"
+  server_pids[$port]="${pgid}"
   echo "[vllm-start] run_id=${run_id} port=${port} recorded pgid=${pgid}"
 }
 
+declare -A server_pids
+
 wait_for_server() {
   local port="$1"
+  local log_file="${vllm_server_log_dir}/vllm_server_${port}.log"
   local deadline=$(( $(date +%s) + health_timeout ))
   while true; do
     if python - "$port" <<'PY'
@@ -63,6 +67,14 @@ PY
     then
       echo "[vllm-start] port=${port} passed /healthz"
       return 0
+    fi
+
+    # Fail fast if the server died (e.g. an import error) instead of waiting
+    # out the full health timeout (job 3298782 lost 30 min this way).
+    if ! kill -0 "${server_pids[$port]}" 2>/dev/null; then
+      echo "[vllm-start] ERROR: port=${port} server process exited; last log lines:" >&2
+      tail -n 20 "${log_file}" >&2
+      return 1
     fi
 
     if [ "$(date +%s)" -ge "${deadline}" ]; then
