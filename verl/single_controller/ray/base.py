@@ -304,16 +304,22 @@ class RayWorkerGroup(WorkerGroup):
                     # schedule the placement group and bring up CUDA context, so the wait
                     # is configurable rather than a fixed 120s.
                     register_center_timeout = int(os.getenv("VERL_REGISTER_CENTER_TIMEOUT_SEC", "900"))
+                    # __ray_ready__ resolves once the actor's __init__ finishes, or raises
+                    # RayActorError if it died. Unlike the state API (get_actor), this does
+                    # not need the dashboard, which main.py starts with include_dashboard=False.
+                    worker_ready_ref = worker.__ray_ready__.remote()
                     for _ in range(register_center_timeout):
                         if f"{self.name_prefix}_register_center" not in list_named_actors():
-                            worker_state = get_actor(worker._actor_id.hex())
-                            if worker_state is not None and worker_state.get("state") == "DEAD":
-                                raise RuntimeError(
-                                    f"Rank 0 worker '{name}' died before it could register "
-                                    f"'{self.name_prefix}_register_center' (death_cause: "
-                                    f"{worker_state.get('death_cause')}). Check the worker's "
-                                    "own stderr/stdout for the real exception."
-                                )
+                            ready, _ = ray.wait([worker_ready_ref], timeout=0)
+                            if ready:
+                                try:
+                                    ray.get(ready[0])
+                                except ray.exceptions.RayActorError as e:
+                                    raise RuntimeError(
+                                        f"Rank 0 worker '{name}' died before it could register "
+                                        f"'{self.name_prefix}_register_center'. Check the worker's "
+                                        "own stderr/stdout for the real exception."
+                                    ) from e
                             time.sleep(1)
                         else:
                             register_center_actor = ray.get_actor(f"{self.name_prefix}_register_center")
