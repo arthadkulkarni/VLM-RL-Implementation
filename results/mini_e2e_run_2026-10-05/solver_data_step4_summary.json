@@ -1,0 +1,34 @@
+{
+    "total_samples": 17,
+    "score_range": [
+        0.3,
+        0.8
+    ],
+    "experiment_name": "Qwen3-VL-8B-Instruct_s_b1_step4",
+    "output_file": "/work/nvme/bffz/akulkarni8/rise/storage_RISE_mini_e2e/local_parquet/Qwen3-VL-8B-Instruct_s_b1_step4_train.parquet",
+    "supervisor_answer_enabled": true,
+    "supervisor_validity_enabled": true,
+    "skill_balanced_upload_enabled": true,
+    "skill_balanced_upload_target": 1500,
+    "skill_balanced_upload_seed": 42,
+    "balanced_sampling_info": {
+        "requested_target": 1500,
+        "per_skill_quota": 187,
+        "selected_before_backfill": 17,
+        "backfill_count": 0
+    },
+    "supervisor_reject_count": 0,
+    "supervisor_reject_rate": 0.0,
+    "declared_skill_counts_after_filter": {
+        "bounded": 17
+    },
+    "declared_skill_counts_after_balance": {
+        "bounded": 17
+    },
+    "unknown_skill_after_filter": 0,
+    "unknown_skill_after_balance": 0,
+    "multiple_choice_total_before_filter": 0,
+    "multiple_choice_with_uppercase_abcd_before_filter": 0,
+    "multiple_choice_total_after_filter": 0,
+    "multiple_choice_with_uppercase_abcd_after_filter": 0
+}
