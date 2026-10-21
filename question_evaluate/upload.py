@@ -14,26 +14,19 @@ SKILL_BALANCED_UPLOAD_ENABLED = os.getenv("SKILL_BALANCED_UPLOAD_ENABLED", "1") 
 SKILL_BALANCED_UPLOAD_TARGET = int(os.getenv("SKILL_BALANCED_UPLOAD_TARGET", "1500"))
 SKILL_BALANCED_UPLOAD_SEED = int(os.getenv("SKILL_BALANCED_UPLOAD_SEED", "42"))
 
+# Query categories (the Frozen Planner's taxonomy); must match ALLOWED_SKILLS in
+# train_examples/reward_function/cot_val.py, which reads the counts written here.
 ALLOWED_SKILLS = [
-    "coarse perception",
-    "fine-grained perception",
-    "instance reasoning",
-    "logical reasoning",
-    "math & counting",
-    "science & technology",
+    "causal",
+    "sequential",
+    "synchronous",
+    "bounded",
+    "static",
+    "dynamic",
+    "identity",
+    "negative",
 ]
-SKILL_ALIASES = {
-    "coarse perception": "coarse perception",
-    "fine grained perception": "fine-grained perception",
-    "fine-grained perception": "fine-grained perception",
-    "instance reasoning": "instance reasoning",
-    "logical reasoning": "logical reasoning",
-    "math": "math & counting",
-    "math & counting": "math & counting",
-    "math and counting": "math & counting",
-    "science & technology": "science & technology",
-    "science and technology": "science & technology",
-}
+SKILL_ALIASES = {skill: skill for skill in ALLOWED_SKILLS}
 
 
 def _log(msg):

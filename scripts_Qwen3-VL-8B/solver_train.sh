@@ -45,8 +45,11 @@ echo "Questioner model: ${questioner_model_path}"
 echo "Target steps: ${train_steps}"
 echo "Training data: ${solver_train_parquet}"
 
-# Disable vLLM compile cache to avoid stale kernel/cache issues across alternating stages.
-export VLLM_DISABLE_COMPILE_CACHE=1
+# vLLM compile cache is on by default (see vllm_service_init/start.sh);
+# RISE_VLLM_COMPILE_CACHE=0 disables it if stale-cache issues show up.
+if [ "${RISE_VLLM_COMPILE_CACHE:-1}" != "1" ]; then
+  export VLLM_DISABLE_COMPILE_CACHE=1
+fi
 
 # Explicit role marker used by the dataset pipeline. Solver training must keep the
 # pseudo-labeled problem/answer fields because the answer is the solver reward target.
@@ -83,9 +86,13 @@ trainer_args=(
   # Solver responses are trained to end with a boxed final answer.
   data.max_response_length=2048
   "data.train_files=${solver_train_parquet}"
-  "data.val_files=${data_dir}/MMStar"
+  "data.val_files=${data_dir}/parquet/zli12321__mmstar" # not used dataset, just for compatibility
   data.format_prompt=./train_examples/format_prompt/solver.jinja
   "worker.actor.model.model_path=${solver_model_path}"
+
+  # padding_free relies on flash-attn's varlen kernels (via RISE_ATTN_IMPLEMENTATION);
+  # a smoke test without flash-attn built should set this to false.
+  "worker.actor.padding_free=${RISE_ACTOR_PADDING_FREE:-true}"
 
   # Keep per-device micro batches small for VLM memory stability.
   worker.actor.micro_batch_size_per_device_for_update=1
@@ -96,6 +103,12 @@ trainer_args=(
   # Maximum rollout tokens batched by vLLM during experience generation.
   worker.rollout.max_num_batched_tokens=20000
 
+  # Overridable batch/rollout sizing (defaults match the full-scale config; a smoke
+  # test can shrink these via env vars to run a fast, low-resource iteration).
+  "data.rollout_batch_size=${RISE_ROLLOUT_BATCH_SIZE:-256}"
+  "worker.actor.global_batch_size=${RISE_GLOBAL_BATCH_SIZE:-64}"
+  "worker.rollout.n=${RISE_ROLLOUT_N:-8}"
+
   # Keep the reference model on GPU to avoid CPU offload overhead.
   worker.ref.fsdp.enable_cpu_offload=false
 
@@ -104,13 +117,16 @@ trainer_args=(
   worker.val_reward.reward_function=./train_examples/reward_function/cot_val_solver.py:compute_score
 
   "trainer.project_name=${PROJECT_NAME:-RISE}"
-  trainer.total_epochs=1
+  # max_steps is the real stop condition; enough epochs guarantee a small
+  # (e.g. 1-batch) dataloader still reaches it instead of ending early.
+  "trainer.total_epochs=${train_steps}"
   "trainer.max_steps=${train_steps}"
   "trainer.save_freq=${train_steps}"
   "trainer.experiment_name=${experiment_name}"
   "trainer.save_checkpoint_path=${model_save_root}/${experiment_name}/"
   trainer.val_before_train=false
   trainer.load_dataloader_state=false
+  "trainer.n_gpus_per_node=${RISE_NUM_GPUS:-8}"
 )
 
 if [ -n "${load_checkpoint_path}" ]; then
@@ -120,8 +136,21 @@ fi
 echo "Training solver..."
 python3 -m verl.trainer.main "${trainer_args[@]}"
 
-step_dir="${model_save_root}/${experiment_name}/global_step_${train_steps}"
+# Merge the step the trainer actually saved, which can differ from the
+# requested one if training ended early.
+latest_step_file="${model_save_root}/${experiment_name}/latest_global_step.txt"
+if [ ! -f "${latest_step_file}" ]; then
+  echo "ERROR: solver trainer saved no checkpoint (missing ${latest_step_file})" >&2
+  exit 1
+fi
+saved_step="$(tr -d '[:space:]' < "${latest_step_file}")"
+step_dir="${model_save_root}/${experiment_name}/global_step_${saved_step}"
 python scripts_Qwen3-VL-8B/model_merger.py --local_dir "${step_dir}/actor"
+
+if [ "${saved_step}" != "${train_steps}" ]; then
+  echo "ERROR: solver trainer stopped at global_step_${saved_step}, expected global_step_${train_steps}" >&2
+  exit 1
+fi
 
 if [ ! -f "${step_dir}/actor/huggingface/config.json" ]; then
   echo "ERROR: merged solver checkpoint is incomplete: ${step_dir}/actor/huggingface" >&2

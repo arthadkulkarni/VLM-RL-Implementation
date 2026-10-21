@@ -38,6 +38,8 @@ from io import BytesIO
 DEBUG_BATCH_PROMPT_SAMPLES = int(os.getenv("DEBUG_BATCH_PROMPT_SAMPLES", "0"))
 QUESTIONER_MASK_SOURCE_QA = os.getenv("QUESTIONER_MASK_SOURCE_QA", "0") == "1"
 RISE_TRAINING_ROLE = os.getenv("RISE_TRAINING_ROLE", "").strip().lower()
+# Timeline segments shown to the video-graph questioner (same knob as the reward server).
+MAX_CONTEXT_SEGMENTS = int(os.getenv("RISE_MAX_CONTEXT_SEGMENTS", "120"))
 
 def collate_fn(features: List[Dict[str, Any]]) -> Dict[str, Any]:
     debug_prompts = [feature.pop("_debug_prompt", None) for feature in features]
@@ -203,6 +205,18 @@ class RLHFDataset(Dataset, ImageProcessMixin):
         if self.image_key and self.image_key not in self.dataset.column_names:
             self.indexed_image_cols = self._discover_indexed_image_columns()
 
+        # Video-graph questioner: one row per video whose answer column holds the
+        # video graph's .json path. The prompt is built from the graph (text only),
+        # and the path is passed through as ground_truth for cot_val.py.
+        self.video_graph_questioner = (
+            RISE_TRAINING_ROLE == "questioner"
+            and len(self.dataset) > 0
+            and self.answer_key in self.dataset.column_names
+            and str(self.dataset[0][self.answer_key]).endswith(".json")
+        )
+        if self.video_graph_questioner:
+            print(f"[dataset] Video-graph questioner mode: {len(self.dataset)} graphs from {data_path}")
+
         # Early-drop multi-image samples for stable single-image evaluation.
         # This avoids vLLM placeholder/image-count mismatches on MMMU-style rows.
         if self.image_key and (self.image_key in self.dataset.column_names or self.indexed_image_cols):
@@ -321,7 +335,18 @@ class RLHFDataset(Dataset, ImageProcessMixin):
     def _mask_source_qa_for_questioner(self) -> bool:
         return QUESTIONER_MASK_SOURCE_QA and RISE_TRAINING_ROLE == "questioner"
 
+    def _build_graph_questioner_messages(self, example: Dict[str, Any]) -> List[Dict[str, Any]]:
+        from video_verifier.prompts import build_questioner_system_prompt, build_questioner_user_prompt, load_graph
+
+        graph = load_graph(example[self.answer_key])
+        return [
+            {"role": "system", "content": build_questioner_system_prompt()},
+            {"role": "user", "content": build_questioner_user_prompt(graph, MAX_CONTEXT_SEGMENTS)},
+        ]
+
     def _build_messages(self, example: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if self.video_graph_questioner:
+            return self._build_graph_questioner_messages(example)
         prompt_str: str = self._normalize_prompt_image_tokens(example[self.prompt_key], self._has_images(example))
         mask_source_qa = self._mask_source_qa_for_questioner()
         if (
@@ -534,7 +559,7 @@ class RLHFDataset(Dataset, ImageProcessMixin):
         example: dict = self.dataset[index]
         example["dataset_index"] = int(example["dataset_index"])
         mask_source_qa = self._mask_source_qa_for_questioner()
-        if mask_source_qa:
+        if mask_source_qa or self.video_graph_questioner:
             example["question"] = ""
         else:
             example["question"] = self._normalize_prompt_image_tokens(example[self.prompt_key], self._has_images(example))
@@ -613,5 +638,8 @@ class RLHFDataset(Dataset, ImageProcessMixin):
         example["raw_prompt_ids"] = raw_prompt_ids
         example["_debug_prompt"] = prompt
         source_answer = example.pop(self.answer_key)
-        example["ground_truth"] = "" if mask_source_qa else source_answer
+        if self.video_graph_questioner:
+            example["ground_truth"] = source_answer  # graph path, read by cot_val.py
+        else:
+            example["ground_truth"] = "" if mask_source_qa else source_answer
         return example

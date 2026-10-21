@@ -15,19 +15,13 @@
 '''
 This reward function is for regular [CoT] -> [Answer] GRPO finetuning
 '''
-import base64
-from io import BytesIO
 import re, os, json, glob
 from typing import Dict, List, Optional
 import time
 import random
-from mathruler.grader import extract_boxed_content, grade_answer
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from collections import Counter
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-from sklearn.cluster import AgglomerativeClustering
-import numpy as np
 STORAGE_PATH = os.getenv("STORAGE_PATH")
 if STORAGE_PATH is None:
     STORAGE_PATH = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -39,30 +33,30 @@ SKILL_BALANCE_ENABLED = os.getenv("SKILL_BALANCE_ENABLED", "1") == "1"
 SKILL_BALANCE_WEIGHT = float(os.getenv("SKILL_BALANCE_WEIGHT", "0.2"))
 REWARD_REQUEST_RETRIES = int(os.getenv("REWARD_REQUEST_RETRIES", "12"))
 REWARD_REQUEST_RETRY_SLEEP_SEC = float(os.getenv("REWARD_REQUEST_RETRY_SLEEP_SEC", "5"))
+# Number of judge/reward vLLM servers started by vllm_service_init/start.sh on ports
+# 6000..6000+N-1. Must match RISE_REWARD_SERVERS used there.
+NUM_REWARD_SERVERS = int(os.getenv("RISE_REWARD_SERVERS", "4"))
+# Scale on the duplicate-share penalty. The share is in (0, 1] while difficulty
+# d is in [0, 0.5], so unscaled a fully duplicated batch (e.g. one graph repeated)
+# drives every valid query to <= -0.5 and swamps d entirely.
+DUPLICATE_PENALTY_WEIGHT = float(os.getenv("RISE_DUPLICATE_PENALTY_WEIGHT", "0.2"))
 
 TEMP_RESULTS_DIR = os.path.join(STORAGE_PATH, "temp_results")
 os.makedirs(TEMP_RESULTS_DIR, exist_ok=True)
 
+# The questioner's query categories (the Frozen Planner's taxonomy). Named
+# "skills" for continuity with RISE's skill-balance machinery.
 ALLOWED_SKILLS = [
-    "coarse perception",
-    "fine-grained perception",
-    "instance reasoning",
-    "logical reasoning",
-    "math & counting",
-    "science & technology",
+    "causal",
+    "sequential",
+    "synchronous",
+    "bounded",
+    "static",
+    "dynamic",
+    "identity",
+    "negative",
 ]
-SKILL_ALIASES = {
-    "coarse perception": "coarse perception",
-    "fine grained perception": "fine-grained perception",
-    "fine-grained perception": "fine-grained perception",
-    "instance reasoning": "instance reasoning",
-    "logical reasoning": "logical reasoning",
-    "math": "math & counting",
-    "math & counting": "math & counting",
-    "math and counting": "math & counting",
-    "science & technology": "science & technology",
-    "science and technology": "science & technology",
-}
+SKILL_ALIASES = {skill: skill for skill in ALLOWED_SKILLS}
 _SKILL_COUNTS_CACHE = {"signature": None, "counts": Counter()}
 
 
@@ -123,106 +117,55 @@ def compute_skill_balance_bonus(skill: Optional[str], counts: Counter) -> float:
         return 0.0
     return (target - current) / max(target, 1.0)
 
-def encode_image_to_base64(image):
-    if image is None:
-        return None
-        
-    if isinstance(image, np.ndarray) and image.dtype == object and image.size >= 1:
-        img_obj = image.item(0) if image.ndim > 0 else image.item()
-    else:
-        img_obj = image
-        
-
-    if 'Image' not in str(type(img_obj)):
-        print(f"Warning: Cannot encode unhandled object type: {type(img_obj)}")
-        return None
-
-    try:
-        buffered = BytesIO()
-        img_obj.save(buffered, format="PNG") 
-        base64_data = base64.b64encode(buffered.getvalue()).decode("utf-8")
-        return f"data:image/png;base64,{base64_data}"
-        
-    except Exception as e:
-        print(f"Error during Base64 encoding: {e}")
-        return None
-
-def _bleu_distance_matrix(sentences):
-    n = len(sentences)
-    dist = np.zeros((n, n))
-    smoother = SmoothingFunction().method1
-    for i in range(n):
-        for j in range(i, n):
-            if i == j:
-                score = 1.0
-            else:
-                ref = [sentences[j].split()]
-                hyp = sentences[i].split()
-                score = sentence_bleu(ref, hyp, smoothing_function=smoother)
-            dist[i, j] = dist[j, i] = 1 - score
-    return dist
-
-def cluster_share_per_problem(
-        problems,
-        distance_threshold: float = 0.5,
-        linkage: str = "average"):
-    if not problems:
+def duplicate_share_per_problem(keys):
+    """Diversity penalty, placeholder: each query's share of the batch taken by
+    exact duplicates of it (same category, normalized question text, video, and
+    time bounds). Open design item (reference doc Section 4d): replace with a
+    distance over taxonomy fields + involved graph entities, clustered like the
+    original BLEU-based cluster_share_per_problem."""
+    if not keys:
         return []
-    print('start clustering')
-    start_time = time.time()
-    dist_mat = _bleu_distance_matrix(problems)
+    total = len(keys)
+    counts = Counter(keys)
+    return [counts[key] / total for key in keys]
 
-    clustering = AgglomerativeClustering(
-        n_clusters=None,
-        distance_threshold=distance_threshold,
-        metric="precomputed",
-        linkage=linkage
-    )
-    labels = clustering.fit_predict(dist_mat)
-    print(f'end clustering, time: {time.time() - start_time}')
-    total = len(problems)
-    cluster_size = Counter(labels)
-    cluster_ratio = {lab: sz / total for lab, sz in cluster_size.items()}
 
-    proportions = [cluster_ratio[lab] for lab in labels]
-    return proportions
+def duplicate_key(item, graph_path):
+    question = " ".join(str(item.get("question", "")).lower().split())
+    time_bounds = tuple(item["time_bounds"]) if item.get("time_bounds") else None
+    return (item.get("declared_skill"), question, graph_path, time_bounds)
+
 
 def format_reward(predict: str) -> float:
     pattern = re.compile(
-        r"^\s*<skill>.+?</skill>\s*"
-        r"<type>(multiple choice|numerical|regression)</type>\s*"
+        r"^\s*<category>.+?</category>\s*"
         r"<question>.+?</question>\s*"
-        r"<answer>.+?</answer>\s*$",
+        r"(?:<time_bounds>.+?</time_bounds>\s*)?$",
         re.DOTALL
     )
     return 1.0 if pattern.fullmatch(predict.strip()) else 0.0
 
 
-def has_multiple_choice_options_in_question(question: str) -> bool:
-    if not question:
-        return False
-    detected = {char for char in question if char in {"A", "B", "C", "D"}}
-    return all(label in detected for label in {"A", "B", "C", "D"})
-
-
-def has_single_letter_answer(answer: str) -> bool:
-    if not answer:
-        return False
-    return re.fullmatch(r"[A-Za-z]", answer.strip()) is not None
+def parse_time_bounds(text):
+    """"start, end" in seconds -> [start, end], or None if malformed."""
+    numbers = re.findall(r"\d+(?:\.\d+)?", text or "")
+    if len(numbers) != 2:
+        return None
+    start, end = float(numbers[0]), float(numbers[1])
+    return [start, end] if start <= end else None
 
 
 def match(generation):
-    pattern = r"<skill>(.*?)</skill>.*?<type>(.*?)</type>.*?<question>(.*?)</question>.*?<answer>(.*?)</answer>"
-    match_obj = re.search(pattern, generation, re.DOTALL)
-
-    if match_obj:
-        return {
-            "declared_skill": normalize_skill_label(match_obj.group(1)),
-            "question": match_obj.group(3).strip(),
-            "answer": match_obj.group(4).strip(),
-            "types": match_obj.group(2).strip()
-        }
-    return None
+    match_obj = re.search(r"<category>(.*?)</category>.*?<question>(.*?)</question>", generation, re.DOTALL)
+    if not match_obj:
+        return None
+    bounds_obj = re.search(r"<time_bounds>(.*?)</time_bounds>", generation, re.DOTALL)
+    return {
+        "declared_skill": normalize_skill_label(match_obj.group(1)),
+        "question": match_obj.group(2).strip(),
+        "time_bounds_raw": bounds_obj.group(1).strip() if bounds_obj else None,
+        "time_bounds": parse_time_bounds(bounds_obj.group(1)) if bounds_obj else None,
+    }
 
 
 def compute_format_components(predict: str) -> Dict[str, float]:
@@ -231,30 +174,23 @@ def compute_format_components(predict: str) -> Dict[str, float]:
     parsed = match(normalized_predict) if structure_ok else None
 
     skill_ok = 1.0 if parsed and parsed.get("declared_skill") in ALLOWED_SKILLS else 0.0
-    type_ok = 1.0 if parsed and parsed.get("types") in {"multiple choice", "numerical", "regression"} else 0.0
     question_ok = 1.0 if parsed and parsed.get("question") else 0.0
-    answer_ok = 1.0 if parsed and parsed.get("answer") else 0.0
+    # time_bounds must parse when given, and is required for `bounded`.
+    if not parsed:
+        time_bounds_ok = 0.0
+    elif parsed["time_bounds_raw"] is not None:
+        time_bounds_ok = 1.0 if parsed["time_bounds"] is not None else 0.0
+    else:
+        time_bounds_ok = 0.0 if parsed.get("declared_skill") == "bounded" else 1.0
 
-    choice_answer_ok = 1.0
-    if parsed and parsed.get("types") == "multiple choice":
-        question_has_choices = has_multiple_choice_options_in_question(parsed.get("question", ""))
-        answer_is_single_letter = has_single_letter_answer(parsed.get("answer", ""))
-        choice_answer_ok = 1.0 if (question_has_choices or answer_is_single_letter) else 0.0
-    elif not parsed:
-        choice_answer_ok = 0.0
-
-    overall_ok = 1.0 if structure_ok and skill_ok and type_ok and question_ok and answer_ok else 0.0
-    if parsed and parsed.get("types") == "multiple choice" and choice_answer_ok != 1.0:
-        overall_ok = 0.0
+    overall_ok = 1.0 if structure_ok and skill_ok and question_ok and time_bounds_ok else 0.0
 
     return {
         "format": overall_ok,
         "format_structure": structure_ok,
         "format_skill": skill_ok,
-        "format_type": type_ok,
         "format_question": question_ok,
-        "format_answer": answer_ok,
-        "format_choice_answer": choice_answer_ok,
+        "format_time_bounds": time_bounds_ok,
     }
 
 def generate_temp_filename(prefix="temp", suffix=".json"):
@@ -262,7 +198,7 @@ def generate_temp_filename(prefix="temp", suffix=".json"):
     rand_part = random.randint(0, 99999)
     return f"{STORAGE_PATH}/temp_results/{prefix}_{timestamp}_{rand_part}{suffix}"
 
-def split_list(lst, n=4):
+def split_list(lst, n=NUM_REWARD_SERVERS):
     k, m = divmod(len(lst), n)
     return [lst[i*k + min(i, m):(i+1)*k + min(i+1, m)] for i in range(n)]
 
@@ -286,23 +222,24 @@ def fetch(index, path, endpoint):
     raise last_exc
 
 def generate_results(data, endpoint="hello"):
-    datas = split_list(data,4)
-    random_names = [generate_temp_filename(prefix=f"temp_{i}", suffix=".json") for i in range(4)]
-    for i in range(4):
+    n = NUM_REWARD_SERVERS
+    datas = split_list(data, n)
+    random_names = [generate_temp_filename(prefix=f"temp_{i}", suffix=".json") for i in range(n)]
+    for i in range(n):
         with open(random_names[i],'w') as f:
             json.dump(datas[i],f,indent=4)
 
     final_results = []
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = [executor.submit(fetch, i, random_names[i], endpoint) for i in range(4)]
+    with ThreadPoolExecutor(max_workers=n) as executor:
+        futures = [executor.submit(fetch, i, random_names[i], endpoint) for i in range(n)]
 
         for future in as_completed(futures):
             print(future.result())
 
-    for i in range(4):
+    for i in range(n):
         with open(random_names[i].replace('.json','_results.json'),'r') as f:
             final_results.extend(json.load(f))
-    for i in range(4):
+    for i in range(n):
         os.remove(random_names[i].replace('.json','_results.json'))
     return final_results
 
@@ -314,53 +251,58 @@ def _shorten_text(text: str, limit: int = 160) -> str:
     return text[: limit - 3] + "..."
 
 
+def difficulty_from_candidates(candidate_scores):
+    """d(x, q) = (1/K) * sum_i min(c_i, 1 - c_i) over the per-candidate
+    consistency scores c_i (reference doc Section 4a); 0 when no candidate
+    was judged."""
+    if not candidate_scores:
+        return 0.0
+    return sum(min(c, 1 - c) for c in candidate_scores) / len(candidate_scores)
+
+
 def compute_score(predicts: List[str], ground_truths: List[str], questions: List[str], description_answers: List[str], format_weight: float = 0.1, images: Optional[List[str]] = None) -> List[Dict[str, float]]:
+    """Questioner reward. Each sample's ground_truth carries its video's graph
+    path (the questioner parquet's answer column); images are unused."""
     print("Computing rewards")
     results = []
     format_components = []
     skill_counts = get_recent_skill_counts() if (SKILL_AWARE_ENABLED and SKILL_BALANCE_ENABLED) else Counter()
-    for idx, (predict, ground_truth) in enumerate(zip(predicts, ground_truths)):
+    for predict, graph_path in zip(predicts, ground_truths):
         predict = re.sub(r"\s*(<|>|/)\s*", r"\1", predict)  # handle qwen2.5vl-32b format
         format_info = compute_format_components(predict)
-        dirty_results = match(predict)
-        if dirty_results == None:
-            item = {"question": "", "declared_skill": None}
-        else:
-            item = dirty_results
-        if images is not None and idx < len(images):
-            encoded_image = encode_image_to_base64(images[idx]) 
-            if encoded_image:
-                item["image"] = encoded_image
-            else:
-                item["image"] = None 
+        item = match(predict) or {"question": "", "declared_skill": None, "time_bounds": None}
+        item["graph_path"] = str(graph_path)
         results.append(item)
         format_components.append(format_info)
+
+    def server_input(item):
+        return {
+            "question": item["question"],
+            "declared_category": item.get("declared_skill"),
+            "time_bounds": item.get("time_bounds"),
+            "graph_path": item["graph_path"],
+        }
+
+    gated_indices = [
+        idx for idx, item in enumerate(results)
+        if format_components[idx]["format"] == 1.0 and item.get("question")
+    ]
 
     validity_results = [
         {
             "question": item.get("question", ""),
-            "declared_skill": item.get("declared_skill"),
-            "skill_match": 0,
+            "declared_category": item.get("declared_skill"),
+            "category_match": 0,
             "valid": 0,
             "reason": "skipped_format_gate",
         }
         for item in results
     ]
-    validity_indices = [
-        idx for idx, item in enumerate(results)
-        if format_components[idx]["format"] == 1.0 and item.get("question")
-    ]
-    if SUPERVISOR_VALIDITY_ENABLED and validity_indices:
-        validity_inputs = [
-            {
-                "question": results[idx]["question"],
-                "image": results[idx].get("image"),
-                "declared_skill": results[idx].get("declared_skill"),
-            }
-            for idx in validity_indices
-        ]
-        fetched_validity_results = generate_results(validity_inputs, endpoint="judge_validity")
-        for idx, item in zip(validity_indices, fetched_validity_results):
+    if SUPERVISOR_VALIDITY_ENABLED and gated_indices:
+        fetched_validity_results = generate_results(
+            [server_input(results[idx]) for idx in gated_indices], endpoint="judge_validity"
+        )
+        for idx, item in zip(gated_indices, fetched_validity_results):
             validity_results[idx] = item
         invalid_examples = [item.get("question", "") for item in validity_results if item.get("valid", 0) != 1][:3]
         print(
@@ -370,38 +312,34 @@ def compute_score(predicts: List[str], ground_truths: List[str], questions: List
     elif SUPERVISOR_VALIDITY_ENABLED:
         print("[reward] validity enabled: valid=0/0, invalid_examples=[]")
 
-    difficulty_results = [{"question": "", "answer": "", "score": 0.0, "results": []} for _ in results]
-    difficulty_indices = [
-        idx for idx, item in enumerate(results)
-        if format_components[idx]["format"] == 1.0 and item.get("question")
-    ]
-    if difficulty_indices:
-        difficulty_inputs = [results[idx] for idx in difficulty_indices]
-        fetched_difficulty_results = generate_results(difficulty_inputs)
-        for idx, item in zip(difficulty_indices, fetched_difficulty_results):
+    difficulty_results = [{"question": "", "candidate_scores": [], "num_candidates": 0} for _ in results]
+    if gated_indices:
+        fetched_difficulty_results = generate_results([server_input(results[idx]) for idx in gated_indices])
+        for idx, item in zip(gated_indices, fetched_difficulty_results):
             difficulty_results[idx] = item
 
     penalties = [0.0 for _ in results]
-    if difficulty_indices:
-        difficulty_questions = [difficulty_results[idx]["question"] for idx in difficulty_indices]
-        penalty_values = cluster_share_per_problem(difficulty_questions, distance_threshold=0.5)
-        assert len(penalty_values) == len(difficulty_indices)
-        for idx, penalty in zip(difficulty_indices, penalty_values):
-            penalties[idx] = penalty
+    if gated_indices:
+        penalty_values = duplicate_share_per_problem(
+            [duplicate_key(results[idx], results[idx]["graph_path"]) for idx in gated_indices]
+        )
+        for idx, penalty in zip(gated_indices, penalty_values):
+            penalties[idx] = DUPLICATE_PENALTY_WEIGHT * penalty
 
     scores = []
-    for i in range(len(difficulty_results)):
+    for i in range(len(results)):
         format_info = format_components[i]
         valid = 1 if validity_results[i].get("valid", 0) == 1 else 0
         validity_bonus = 0.1 if valid == 1 else 0.0
         declared_skill = results[i].get("declared_skill")
-        skill_match = 1 if validity_results[i].get("skill_match", 0) == 1 else 0
+        skill_match = 1 if validity_results[i].get("category_match", 0) == 1 else 0
         skill_balance_bonus = 0.0
         if valid == 1 and SKILL_AWARE_ENABLED and SKILL_BALANCE_ENABLED:
             skill_balance_bonus = compute_skill_balance_bonus(declared_skill, skill_counts)
         penalty = penalties[i]
+        candidate_scores = difficulty_results[i].get("candidate_scores") or []
         skill_indicator_metrics = {
-            f"skill_{skill.replace(' & ', '_').replace('-', '_').replace(' ', '_')}": 1.0 if declared_skill == skill else 0.0
+            f"skill_{skill}": 1.0 if declared_skill == skill else 0.0
             for skill in ALLOWED_SKILLS
         }
 
@@ -409,18 +347,20 @@ def compute_score(predicts: List[str], ground_truths: List[str], questions: List
             difficulty_score = -1.0
             final_score = -1.0
         else:
-            difficulty_score = min(difficulty_results[i]["score"], 1 - difficulty_results[i]["score"]) - penalty
+            difficulty_score = difficulty_from_candidates(candidate_scores) - penalty
             final_score = difficulty_score + validity_bonus + SKILL_BALANCE_WEIGHT * skill_balance_bonus
         score_item = {
             "overall": final_score,
             "format": format_info["format"],
             "format_skill": format_info["format_skill"],
-            "format_choice_answer": format_info["format_choice_answer"],
+            "format_time_bounds": format_info["format_time_bounds"],
             "validity": valid,
             "skill_match": skill_match,
             "skill_balance_bonus": skill_balance_bonus,
             "difficulty": difficulty_score,
             "penalty": penalty,
+            "num_candidates": float(difficulty_results[i].get("num_candidates", 0)),
+            "judged_candidates": float(len(candidate_scores)),
         }
         score_item.update(skill_indicator_metrics)
         scores.append(score_item)
@@ -428,19 +368,19 @@ def compute_score(predicts: List[str], ground_truths: List[str], questions: List
         debug_count = min(QUESTIONER_DEBUG_SAMPLES, len(scores))
         print(f"[questioner-debug] showing {debug_count}/{len(scores)} samples")
         for i in range(debug_count):
-            item = results[i] if i < len(results) else {}
+            item = results[i]
             score_item = scores[i]
             print(
                 f"[questioner-debug-{i}] "
-                f"skill={item.get('declared_skill') or 'unknown'} | "
-                f"type={item.get('types', '')} | "
+                f"category={item.get('declared_skill') or 'unknown'} | "
+                f"time_bounds={item.get('time_bounds')} | "
                 f"question={_shorten_text(item.get('question', ''))} | "
-                f"answer={_shorten_text(item.get('answer', ''))} | "
                 f"overall={score_item['overall']:.4f} | "
                 f"format={score_item['format']:.1f} | "
                 f"validity={score_item['validity']} | "
-                f"skill_match={score_item['skill_match']} | "
+                f"category_match={score_item['skill_match']} | "
                 f"skill_bonus={score_item['skill_balance_bonus']:.4f} | "
+                f"candidates={int(score_item['judged_candidates'])}/{int(score_item['num_candidates'])} | "
                 f"difficulty={score_item['difficulty']:.4f}"
             )
     return scores

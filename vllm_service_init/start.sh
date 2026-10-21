@@ -4,7 +4,15 @@ set -euo pipefail
 model_path=$1
 run_id=$2
 pgid_file="${VLLM_SERVER_PGID_FILE:-/tmp/${USER}/visplay_vllm_server_pgids_default}"
-export VLLM_DISABLE_COMPILE_CACHE=1
+# vLLM compile cache: torch.compile takes ~3 min per server start and only
+# depends on the architecture + vLLM config, not the weights, so alternating
+# checkpoints reuse it. One cache root per GPU slot keeps the servers that
+# start together from writing the same cache files. RISE_VLLM_COMPILE_CACHE=0
+# restores the old always-recompile behaviour.
+vllm_cache_base="${RISE_VLLM_CACHE_DIR:-${HOME}/.cache/vllm_rise}"
+if [ "${RISE_VLLM_COMPILE_CACHE:-1}" != "1" ]; then
+  export VLLM_DISABLE_COMPILE_CACHE=1
+fi
 vllm_server_max_model_len="${VLLM_SERVER_MAX_MODEL_LEN:-12288}"
 vllm_server_gpu_mem_util="${VLLM_SERVER_GPU_MEM_UTIL:-0.8}"
 vllm_server_log_dir="${VLLM_SERVER_LOG_DIR:-${STORAGE_PATH:-../storage_vllm}/temp_results}"
@@ -21,7 +29,8 @@ start_one_server() {
   local log_file="${vllm_server_log_dir}/vllm_server_${port}.log"
   local pgid=""
   echo "[vllm-start] launching port=${port} cuda=${cuda_id} log=${log_file}"
-  setsid env CUDA_VISIBLE_DEVICES="$cuda_id" python vllm_service_init/start_vllm_server.py \
+  setsid env CUDA_VISIBLE_DEVICES="$cuda_id" VLLM_CACHE_ROOT="${vllm_cache_base}/server_gpu${cuda_id}" \
+    python vllm_service_init/start_vllm_server.py \
     --port "$port" \
     --model_path "$model_path" \
     --max_model_len "$vllm_server_max_model_len" \
@@ -29,11 +38,15 @@ start_one_server() {
     >"$log_file" 2>&1 &
   pgid=$!
   printf "%s\n" "${pgid}" >> "${pgid_file}"
+  server_pids[$port]="${pgid}"
   echo "[vllm-start] run_id=${run_id} port=${port} recorded pgid=${pgid}"
 }
 
+declare -A server_pids
+
 wait_for_server() {
   local port="$1"
+  local log_file="${vllm_server_log_dir}/vllm_server_${port}.log"
   local deadline=$(( $(date +%s) + health_timeout ))
   while true; do
     if python - "$port" <<'PY'
@@ -56,6 +69,14 @@ PY
       return 0
     fi
 
+    # Fail fast if the server died (e.g. an import error) instead of waiting
+    # out the full health timeout (job 3298782 lost 30 min this way).
+    if ! kill -0 "${server_pids[$port]}" 2>/dev/null; then
+      echo "[vllm-start] ERROR: port=${port} server process exited; last log lines:" >&2
+      tail -n 20 "${log_file}" >&2
+      return 1
+    fi
+
     if [ "$(date +%s)" -ge "${deadline}" ]; then
       echo "[vllm-start] ERROR: port=${port} did not become healthy within ${health_timeout}s" >&2
       return 1
@@ -64,14 +85,22 @@ PY
   done
 }
 
-start_one_server 4 6000
-start_one_server 5 6001
-start_one_server 6 6002
-start_one_server 7 6003
+# GPU offset where reward servers start (training uses GPUs 0..offset-1) and how many
+# reward servers to launch (one per remaining GPU, ports 6000..6000+n-1). Must match
+# RISE_REWARD_SERVERS read by train_examples/reward_function/cot_val.py.
+gpu_offset="${RISE_REWARD_GPU_OFFSET:-4}"
+num_servers="${RISE_REWARD_SERVERS:-4}"
 
-wait_for_server 6000
-wait_for_server 6001
-wait_for_server 6002
-wait_for_server 6003
+ports=()
+for ((i = 0; i < num_servers; i++)); do
+  cuda_id=$((gpu_offset + i))
+  port=$((6000 + i))
+  ports+=("$port")
+  start_one_server "$cuda_id" "$port"
+done
+
+for port in "${ports[@]}"; do
+  wait_for_server "$port"
+done
 
 echo "[vllm-start] all judge servers are healthy"

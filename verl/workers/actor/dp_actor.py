@@ -37,7 +37,13 @@ from .config import ActorConfig
 try:
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input
 except ImportError:
-    from transformers.modeling_flash_attention_utils import index_first_axis, pad_input, unpad_input
+    try:
+        from transformers.modeling_flash_attention_utils import index_first_axis, pad_input, unpad_input
+    except ImportError:
+        # Neither flash-attn nor a transformers version exposing these helpers is
+        # available. Only `padding_free=True` actually needs them (see below), so
+        # defer the failure to that code path instead of crashing on import.
+        index_first_axis = pad_input = unpad_input = None
 
 
 __all__ = ["DataParallelPPOActor"]
@@ -84,6 +90,13 @@ class DataParallelPPOActor(BasePPOActor):
                 )
 
         if self.config.padding_free:
+            if unpad_input is None:
+                raise ImportError(
+                    "worker.actor.padding_free=true requires flash-attn (or a transformers "
+                    "version exposing modeling_flash_attention_utils' bert_padding helpers), "
+                    "neither of which is importable here. Install flash-attn or set "
+                    "worker.actor.padding_free=false."
+                )
             input_ids_rmpad, indices, *_ = unpad_input(
                 input_ids.unsqueeze(-1), attention_mask
             )  # input_ids_rmpad (total_nnz, ...)

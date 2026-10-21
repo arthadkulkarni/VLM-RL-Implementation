@@ -119,7 +119,24 @@ def main():
                 "VLLM_ALLREDUCE_USE_SYMM_MEM": "0",
             }
         }
-        ray.init(runtime_env=runtime_env)
+        # On GH200 nodes (288 logical CPUs), letting Ray auto-detect num_cpus makes
+        # it prestart one worker process per CPU at cluster startup. That burst
+        # overwhelms the raylet/GCS (observed: 254 "worker did not register within
+        # timeout" + 32 broken-pipe errors in raylet.err within the first few
+        # seconds) and can hang the driver's own ray.init() -> connect() call
+        # indefinitely (confirmed via py-spy dump showing the driver stuck in
+        # ray/_private/worker.py's connect()). A training job here only needs a
+        # couple of GPU actors, not hundreds of CPU workers, so cap it.
+        ray_num_cpus = os.getenv("RISE_RAY_NUM_CPUS")
+        # The dashboard is unused here and failed to start right before a raylet
+        # startup timeout (job 3258420); a per-job temp dir keeps that job's
+        # raylet/GCS logs apart from stale sessions so they can be inspected.
+        ray.init(
+            runtime_env=runtime_env,
+            num_cpus=int(ray_num_cpus) if ray_num_cpus else None,
+            include_dashboard=False,
+            _temp_dir=os.getenv("RISE_RAY_TMPDIR") or None,
+        )
 
     use_remote_runner = os.getenv("VERL_USE_REMOTE_RUNNER", "0") == "1"
     if use_remote_runner:
