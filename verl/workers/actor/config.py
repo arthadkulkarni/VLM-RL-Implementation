@@ -17,7 +17,22 @@ Actor config
 
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+
+@dataclass
+class LoraConfig:
+    enabled: bool = False
+    rank: int = 16
+    alpha: int = 32
+    dropout: float = 0.0
+    # Language-model linears only; the vision tower stays frozen and unadapted.
+    target_modules: List[str] = field(
+        default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    )
+    # Start from this saved peft adapter (its own rank/alpha/targets apply)
+    # instead of a fresh one; how role alternation hands an adapter on.
+    adapter_path: Optional[str] = None
 
 
 @dataclass
@@ -28,6 +43,7 @@ class ModelConfig:
     enable_gradient_checkpointing: bool = True
     trust_remote_code: bool = True
     freeze_vision_tower: bool = False
+    lora: LoraConfig = field(default_factory=LoraConfig)
 
     def post_init(self):
         if self.tokenizer_path is None:
@@ -38,6 +54,9 @@ class ModelConfig:
 
         if self.tokenizer_path is not None and os.path.exists(self.tokenizer_path):
             self.tokenizer_path = os.path.abspath(self.tokenizer_path)
+
+        if self.lora.adapter_path:
+            self.lora.adapter_path = os.path.abspath(self.lora.adapter_path)
 
 
 @dataclass

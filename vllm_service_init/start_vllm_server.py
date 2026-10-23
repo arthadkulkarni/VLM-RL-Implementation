@@ -29,6 +29,7 @@ import io
 from PIL import Image
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from verl.utils.lora_utils import adapter_from_env, vllm_adapter
 from verl.utils.vllm_utils import VLLMHijack
 from video_graph_builder.montage import stack_montages
 from video_graph_builder.parsing import parse_caption_entities
@@ -80,6 +81,8 @@ print('[init] Loading model...')
 
 # See VLLMHijack.hijack() for the RISE_FORCE_VIT_SDPA vision-tower attention patch.
 VLLMHijack.hijack()
+# LoRA mode: serve the verifier adapter on the base model (see main.sh).
+LORA_KWARGS, LORA_REQUEST = vllm_adapter(adapter_from_env())
 tokenizer = AutoTokenizer.from_pretrained(args.model_path)
 model = vllm.LLM(
     model=args.model_path,
@@ -91,6 +94,7 @@ model = vllm.LLM(
     # Every endpoint sends exactly one image and never video; without this
     # vLLM profiles the encoder with a maximum-size video at startup.
     limit_mm_per_prompt={"image": 1, "video": 0},
+    **LORA_KWARGS,
 )
 
 sample_params = vllm.SamplingParams(
@@ -244,7 +248,7 @@ def generate_with_fallback(name, batch_name, prompts, sampling_params, batch_ite
             f"(prompts {batch_start}-{batch_end - 1}, size={len(batch)})"
         )
         try:
-            outputs.extend(model.generate(batch, sampling_params=sampling_params, use_tqdm=use_tqdm))
+            outputs.extend(model.generate(batch, sampling_params=sampling_params, use_tqdm=use_tqdm, lora_request=LORA_REQUEST))
         except Exception as e:
             dump_failed_batch(name, batch_name, batch_start, batch_end, items)
             if engine_is_dead(e):
@@ -254,7 +258,7 @@ def generate_with_fallback(name, batch_name, prompts, sampling_params, batch_ite
                 single_item = items[local_idx]
                 single_index = batch_start + local_idx
                 try:
-                    single_output = model.generate([single_prompt], sampling_params=sampling_params, use_tqdm=False)
+                    single_output = model.generate([single_prompt], sampling_params=sampling_params, use_tqdm=False, lora_request=LORA_REQUEST)
                     outputs.extend(single_output)
                 except Exception as single_exc:
                     dump_failed_batch(

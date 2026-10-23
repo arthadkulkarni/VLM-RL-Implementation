@@ -23,9 +23,12 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
 from vllm import LLM
 from vllm.distributed import parallel_state as vllm_ps
+from vllm.lora.request import LoRARequest
 
 from ...protocol import DataProto, all_gather_data_proto
+from ...utils.lora_utils import is_peft_model, peft_config_dict, split_peft_state
 from ...utils.model_utils import print_gpu_memory_usage
+from ...utils.vllm_utils import TensorLoRARequest
 from .base import BaseShardingManager
 
 
@@ -44,6 +47,14 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         self.tp_size = vllm_ps.get_tensor_model_parallel_world_size()
         self.tp_rank = vllm_ps.get_tensor_model_parallel_rank()
         self.tp_group = vllm_ps.get_tensor_model_parallel_group().device_group
+
+        # With a LoRA actor, vLLM serves the frozen base (synced once) plus the
+        # adapter, re-registered under a new id on every sync; lora_request is
+        # what generate() must pass to use it.
+        peft_model = getattr(module, "_fsdp_wrapped_module", module)
+        self.peft_config = peft_config_dict(peft_model) if is_peft_model(peft_model) else None
+        self.base_synced = False
+        self.lora_request = None
 
         # Record freed bytes to estimate memory usage correctly
         # https://github.com/vllm-project/vllm/pull/11743#issuecomment-2754338119
@@ -82,7 +93,10 @@ class FSDPVLLMShardingManager(BaseShardingManager):
             self.inference_engine.wake_up()
 
         model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
-        model.load_weights(self._make_weight_iterator(actor_weights))
+        if self.peft_config is None:
+            model.load_weights(self._make_weight_iterator(actor_weights))
+        else:
+            self._sync_lora(model, actor_weights)
         print_gpu_memory_usage("After sync model weights in sharding manager")
 
         del actor_weights
@@ -96,6 +110,32 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         if self.device_mesh is not None:
             self.torch_random_states = torch.cuda.get_rng_state()
             torch.cuda.set_rng_state(self.gen_random_states)
+
+    def _sync_lora(self, model, actor_weights: Dict[str, Union[torch.Tensor, DTensor]]):
+        base_weights, lora_weights = split_peft_state(actor_weights)
+        if not self.base_synced:  # frozen, and vLLM's sleep(level=1) keeps weights
+            model.load_weights(self._make_weight_iterator(base_weights))
+            self.base_synced = True
+
+        lora_tensors = dict(self._make_weight_iterator(lora_weights))
+        engine = self.inference_engine.llm_engine
+        if self.lora_request is not None:
+            engine.remove_lora(self.lora_request.lora_int_id)
+        lora_id = 1 if self.lora_request is None else self.lora_request.lora_int_id + 1
+        name, path = f"actor_lora_{lora_id}", "actor_lora_tensors"  # path unused for tensor requests
+        engine.add_lora(
+            TensorLoRARequest(
+                lora_name=name,
+                lora_int_id=lora_id,
+                lora_path=path,
+                peft_config=self.peft_config,
+                lora_tensors=lora_tensors,
+            )
+        )
+        self.lora_request = LoRARequest(lora_name=name, lora_int_id=lora_id, lora_path=path)
+        if dist.get_rank() == 0:
+            sent_b_norm = sum(t.float().norm().item() ** 2 for k, t in lora_tensors.items() if "lora_B" in k) ** 0.5
+            print(f"Synced LoRA adapter {lora_id} to vLLM: {len(lora_tensors)} tensors, |B| = {sent_b_norm:.4g}.")
 
     def __exit__(self, exc_type, exc_value, traceback):
         print_gpu_memory_usage("Before vllm offload in sharding manager")

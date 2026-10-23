@@ -27,6 +27,7 @@ model_save_root="${MODEL_SAVE_ROOT:-${STORAGE_PATH}/models}"
 parquet_dir="${STORAGE_PATH}/local_parquet"
 
 source scripts_Qwen3-VL-8B/runtime_cleanup.sh
+source scripts_Qwen3-VL-8B/lora_mode.sh
 trap runtime_cleanup_all EXIT
 
 mkdir -p "${model_save_root}" "${parquet_dir}"
@@ -44,6 +45,10 @@ echo "Solver model: ${solver_model_path}"
 echo "Questioner model: ${questioner_model_path}"
 echo "Target steps: ${train_steps}"
 echo "Training data: ${solver_train_parquet}"
+if lora_enabled; then
+  echo "LoRA mode: generating with '$(questioner_serve_adapter)', pseudo-labeling with '$(solver_serve_adapter)'," \
+    "training solver adapter '${RISE_SOLVER_ADAPTER:-}'"
+fi
 
 # vLLM compile cache is on by default (see vllm_service_init/start.sh);
 # RISE_VLLM_COMPILE_CACHE=0 disables it if stale-cache issues show up.
@@ -56,7 +61,10 @@ fi
 export RISE_TRAINING_ROLE=solver
 
 if [ ! -s "${solver_train_parquet}" ]; then
+  # In LoRA mode generation serves the questioner adapter A_Q and evaluation
+  # the verifier adapter A_V, each on the shared base.
   echo "Generating questions with the current questioner..."
+  RISE_LORA_PATH="$(lora_serve_path "$(questioner_serve_adapter)")" \
   bash question_generate/question_generate.bash \
     "${questioner_model_path}" \
     "${num_samples_per_micro}" \
@@ -66,6 +74,7 @@ if [ ! -s "${solver_train_parquet}" ]; then
   runtime_cleanup_all
 
   echo "Evaluating generated questions with the current solver..."
+  RISE_LORA_PATH="$(lora_serve_path "$(solver_serve_adapter)")" \
   bash question_evaluate/evaluate.sh "${solver_model_path}" "${data_save_name}"
 
   runtime_cleanup_all
@@ -132,29 +141,13 @@ trainer_args=(
 if [ -n "${load_checkpoint_path}" ]; then
   trainer_args+=("trainer.load_checkpoint_path=${load_checkpoint_path}")
 fi
+if lora_enabled; then
+  mapfile -t lora_args < <(lora_trainer_args "${RISE_SOLVER_ADAPTER:-}")
+  trainer_args+=("${lora_args[@]}")
+fi
 
 echo "Training solver..."
 python3 -m verl.trainer.main "${trainer_args[@]}"
 
-# Merge the step the trainer actually saved, which can differ from the
-# requested one if training ended early.
-latest_step_file="${model_save_root}/${experiment_name}/latest_global_step.txt"
-if [ ! -f "${latest_step_file}" ]; then
-  echo "ERROR: solver trainer saved no checkpoint (missing ${latest_step_file})" >&2
-  exit 1
-fi
-saved_step="$(tr -d '[:space:]' < "${latest_step_file}")"
-step_dir="${model_save_root}/${experiment_name}/global_step_${saved_step}"
-python scripts_Qwen3-VL-8B/model_merger.py --local_dir "${step_dir}/actor"
-
-if [ "${saved_step}" != "${train_steps}" ]; then
-  echo "ERROR: solver trainer stopped at global_step_${saved_step}, expected global_step_${train_steps}" >&2
-  exit 1
-fi
-
-if [ ! -f "${step_dir}/actor/huggingface/config.json" ]; then
-  echo "ERROR: merged solver checkpoint is incomplete: ${step_dir}/actor/huggingface" >&2
-  exit 1
-fi
-
-echo "Solver training finished: ${step_dir}/actor/huggingface"
+result="$(finish_stage_checkpoint solver "${model_save_root}/${experiment_name}" "${train_steps}")"
+echo "Solver training finished: ${result}"

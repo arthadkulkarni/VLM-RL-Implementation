@@ -46,6 +46,9 @@ export MICRO_STEPS="${MICRO_STEPS:-5}"
 export GLOBAL_STEP="${MICRO_STEPS}"
 
 source scripts_Qwen3-VL-8B/runtime_cleanup.sh
+# RISE_LORA=1 trains the questioner and the solver/verifier as two LoRA
+# adapters (A_Q, A_V) on one frozen base; see lora_mode.sh.
+source scripts_Qwen3-VL-8B/lora_mode.sh
 trap runtime_cleanup_all EXIT
 
 echo "Project: ${PROJECT_NAME}"
@@ -53,10 +56,81 @@ echo "Base model: ${BASE_MODEL}"
 echo "Storage path: ${STORAGE_PATH}"
 echo "Model save root: ${MODEL_SAVE_ROOT}"
 echo "Schedule: BIG_ROUNDS=${BIG_ROUNDS}, MICRO_ITERS=${MICRO_ITERS}, MICRO_STEPS=${MICRO_STEPS}"
+if lora_enabled; then
+  echo "LoRA mode: adapters A_Q and A_V on ${BASE_MODEL}, rank ${RISE_LORA_RANK:-16}"
+fi
+
+# Adapter merging across rounds (LoRA mode). After each micro iteration (a
+# round), each role's raw adapters of all rounds so far are merged into its
+# round adapter, saved once per round under round_adapters/<role>/round_NNN:
+#   none    the newest raw adapter; nothing is merged or saved (default)
+#   linear  running mean of all rounds
+#   ema     merged = RISE_ADAPTER_EMA_DECAY * merged + (1 - decay) * new
+# Round adapters are served (question generation, pseudo-labeling, judging);
+# training always continues each role's raw adapter. See verl/utils/lora_merge.py.
+export RISE_ADAPTER_MERGE="${RISE_ADAPTER_MERGE:-none}"
+export RISE_ADAPTER_EMA_DECAY="${RISE_ADAPTER_EMA_DECAY:-0.9}"
+case "${RISE_ADAPTER_MERGE}" in
+  none) ;;
+  linear | ema)
+    if ! lora_enabled; then
+      echo "ERROR: RISE_ADAPTER_MERGE=${RISE_ADAPTER_MERGE} merges LoRA adapters; it needs RISE_LORA=1" >&2
+      exit 1
+    fi
+    echo "Adapter merge: ${RISE_ADAPTER_MERGE} (EMA decay ${RISE_ADAPTER_EMA_DECAY}), served from ${MODEL_SAVE_ROOT}/round_adapters"
+    ;;
+  *)
+    echo "ERROR: RISE_ADAPTER_MERGE must be none, linear or ema (got '${RISE_ADAPTER_MERGE}')" >&2
+    exit 1
+    ;;
+esac
+
+# Role $1's round adapter from its raw adapters of every round so far ($2...,
+# oldest first): merged and saved once per round, or the newest raw adapter
+# with RISE_ADAPTER_MERGE=none.
+round_adapter() {
+  local role="$1"
+  shift
+  if [ "${RISE_ADAPTER_MERGE}" = "none" ]; then
+    echo "${@: -1}"
+    return
+  fi
+  local round_dir
+  round_dir="${MODEL_SAVE_ROOT}/round_adapters/${role}/round_$(printf '%03d' "$#")"
+  if [ ! -f "${round_dir}/adapter_config.json" ]; then
+    python scripts_Qwen3-VL-8B/merge_adapters.py --mode "${RISE_ADAPTER_MERGE}" \
+      --decay "${RISE_ADAPTER_EMA_DECAY}" --adapters "$@" --output "${round_dir}" >&2
+  fi
+  echo "${round_dir}"
+}
+
+# What a finished step hands to the next stage: the merged HF model, or in
+# LoRA mode the adapter.
+step_artifact() {
+  if lora_enabled; then
+    echo "$1/actor/lora_adapter"
+  else
+    echo "$1/actor/huggingface"
+  fi
+}
 
 is_complete_step_dir() {
   local step_dir="$1"
-  [ -f "${step_dir}/actor/huggingface/config.json" ]
+  if lora_enabled; then
+    [ -f "$(step_artifact "${step_dir}")/adapter_config.json" ]
+  else
+    [ -f "$(step_artifact "${step_dir}")/config.json" ]
+  fi
+}
+
+# A stage's model path: the role's checkpoint, or the shared base in LoRA mode
+# (the role's adapter is passed separately).
+stage_model() {
+  if lora_enabled; then
+    echo "${BASE_MODEL}"
+  else
+    echo "$1"
+  fi
 }
 
 find_hf_ckpt_by_step() {
@@ -65,7 +139,7 @@ find_hf_ckpt_by_step() {
   local step_dir="${MODEL_SAVE_ROOT}/${exp_name}/global_step_${step}"
 
   if is_complete_step_dir "${step_dir}"; then
-    echo "${step_dir}/actor/huggingface"
+    step_artifact "${step_dir}"
   fi
 }
 
@@ -90,14 +164,27 @@ find_latest_hf_ckpt() {
   local step_dir=""
   while IFS= read -r step_dir; do
     if is_complete_step_dir "${step_dir}"; then
-      echo "${step_dir}/actor/huggingface"
+      step_artifact "${step_dir}"
       return
     fi
   done < <(find "${exp_root}" -maxdepth 1 -type d -name 'global_step_*' | sort -V -r)
 }
 
-prev_questioner_ckpt="${BASE_MODEL}"
-prev_solver_ckpt="${BASE_MODEL}"
+# Each role's latest model, or in LoRA mode its latest adapter (empty: a
+# fresh adapter for training, the plain base for serving).
+if lora_enabled; then
+  prev_questioner_ckpt=""
+  prev_solver_ckpt=""
+else
+  prev_questioner_ckpt="${BASE_MODEL}"
+  prev_solver_ckpt="${BASE_MODEL}"
+fi
+# Every round's raw checkpoint per role, and the round adapters served
+# (empty before round 1: the plain base).
+questioner_rounds=()
+solver_rounds=()
+questioner_served=""
+solver_served=""
 
 for big in $(seq 1 "${BIG_ROUNDS}"); do
   echo "=== Big round ${big}/${BIG_ROUNDS} ==="
@@ -128,9 +215,12 @@ for big in $(seq 1 "${BIG_ROUNDS}"); do
         q_load_ckpt="$(find_resume_ckpt_by_step "${q_exp}" "${prev_steps}" || true)"
       fi
 
+      RISE_QUESTIONER_ADAPTER="$(lora_serve_path "${prev_questioner_ckpt}")" \
+      RISE_SOLVER_ADAPTER="$(lora_serve_path "${prev_solver_ckpt}")" \
+      RISE_SOLVER_SERVE_ADAPTER="$(lora_serve_path "${solver_served}")" \
       bash scripts_Qwen3-VL-8B/questioner_train.sh \
-        "${prev_solver_ckpt}" \
-        "${prev_questioner_ckpt}" \
+        "$(stage_model "${prev_solver_ckpt}")" \
+        "$(stage_model "${prev_questioner_ckpt}")" \
         "${q_exp}" \
         "${target_steps}" \
         "${q_load_ckpt}"
@@ -143,6 +233,8 @@ for big in $(seq 1 "${BIG_ROUNDS}"); do
     else
       echo "Questioner checkpoint already exists: ${q_ckpt}"
     fi
+    questioner_rounds+=("${q_ckpt}")
+    questioner_served="$(round_adapter questioner "${questioner_rounds[@]}")"
 
     runtime_cleanup_all
 
@@ -153,9 +245,13 @@ for big in $(seq 1 "${BIG_ROUNDS}"); do
         s_load_ckpt="$(find_resume_ckpt_by_step "${s_exp}" "${prev_steps}" || true)"
       fi
 
+      RISE_QUESTIONER_ADAPTER="$(lora_serve_path "${q_ckpt}")" \
+      RISE_SOLVER_ADAPTER="$(lora_serve_path "${prev_solver_ckpt}")" \
+      RISE_QUESTIONER_SERVE_ADAPTER="$(lora_serve_path "${questioner_served}")" \
+      RISE_SOLVER_SERVE_ADAPTER="$(lora_serve_path "${solver_served}")" \
       bash scripts_Qwen3-VL-8B/solver_train.sh \
-        "${prev_solver_ckpt}" \
-        "${q_ckpt}" \
+        "$(stage_model "${prev_solver_ckpt}")" \
+        "$(stage_model "${q_ckpt}")" \
         "${s_exp}" \
         "${target_steps}" \
         "${s_load_ckpt}"
@@ -168,6 +264,8 @@ for big in $(seq 1 "${BIG_ROUNDS}"); do
     else
       echo "Solver checkpoint already exists: ${s_ckpt}"
     fi
+    solver_rounds+=("${s_ckpt}")
+    solver_served="$(round_adapter solver "${solver_rounds[@]}")"
 
     prev_questioner_ckpt="${q_ckpt}"
     prev_solver_ckpt="${s_ckpt}"

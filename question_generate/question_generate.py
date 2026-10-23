@@ -6,6 +6,7 @@ from typing import List
 from vllm.outputs import RequestOutput
 import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from verl.utils.lora_utils import adapter_from_env, vllm_adapter
 from verl.utils.vllm_utils import VLLMHijack
 from question_evaluate.records import generated_record
 from video_verifier.prompts import (
@@ -18,6 +19,8 @@ import json
 import os
 import random
 STORAGE_PATH = os.getenv("STORAGE_PATH")
+# LoRA mode: serve the questioner adapter on the base model (see main.sh).
+LORA_KWARGS, LORA_REQUEST = vllm_adapter(adapter_from_env())
 QUESTION_GENERATE_SHUFFLE = os.getenv("QUESTION_GENERATE_SHUFFLE", "1") == "1"
 QUESTION_GENERATE_SHUFFLE_SEED = int(os.getenv("QUESTION_GENERATE_SHUFFLE_SEED", "42"))
 
@@ -97,6 +100,7 @@ def build_vllm_model(args):
                 gpu_memory_utilization=args.gpu_mem_util,
                 max_model_len=args.max_model_len,
                 seed=int(args.suffix),
+                **LORA_KWARGS,
             )
         except Exception as exc:
             last_exc = exc
@@ -192,7 +196,7 @@ def main(args):
         )
 
         try:
-            completions: List[RequestOutput] = model.generate([{"prompt": prompt}], sampling_params=sample_params)
+            completions: List[RequestOutput] = model.generate([{"prompt": prompt}], sampling_params=sample_params, lora_request=LORA_REQUEST)
         except Exception as e:
             print(f"Generation failed for dataset_idx={i}: {e}")
             results.append({
