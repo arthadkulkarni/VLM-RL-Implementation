@@ -147,11 +147,12 @@ def format_reward(predict: str) -> float:
 
 
 def parse_time_bounds(text):
-    """"start, end" in seconds -> [start, end], or None if malformed."""
-    numbers = re.findall(r"\d+(?:\.\d+)?", text or "")
-    if len(numbers) != 2:
+    """"start, end" -> [start, end] in seconds, or None if malformed. Each time
+    is seconds or [H:]MM:SS(.s), the format the timeline in the prompt uses."""
+    times = re.findall(r"\d+(?::\d+){0,2}(?:\.\d+)?", text or "")
+    if len(times) != 2:
         return None
-    start, end = float(numbers[0]), float(numbers[1])
+    start, end = (sum(float(part) * 60 ** i for i, part in enumerate(reversed(t.split(":")))) for t in times)
     return [start, end] if start <= end else None
 
 

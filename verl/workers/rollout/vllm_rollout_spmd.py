@@ -104,7 +104,9 @@ class vLLMRollout(BaseRollout):
         }
         default_sampling_params = SamplingParams()
         for key in config.to_dict().keys():
-            if hasattr(default_sampling_params, key):
+            # The engine is already seeded; a per-request seed would replay the
+            # same random draws every step (identical rollouts across steps).
+            if key != "seed" and hasattr(default_sampling_params, key):
                 sampling_kwargs[key] = getattr(config, key)
 
         print(f"Sampling params: {sampling_kwargs}.")
