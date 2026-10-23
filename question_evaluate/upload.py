@@ -6,7 +6,10 @@ import time
 import pyarrow.parquet as pq
 import re
 import random
-from collections import Counter
+import sys
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from question_evaluate.records import apply_skill_balanced_sampling, count_skills, upload_row
 
 SUPERVISOR_VALIDITY_ENABLED = os.getenv("SUPERVISOR_VALIDITY_ENABLED", "1") == "1"
 SUPERVISOR_ANSWER_ENABLED = os.getenv("SUPERVISOR_ANSWER_ENABLED", "1") == "1"
@@ -14,90 +17,9 @@ SKILL_BALANCED_UPLOAD_ENABLED = os.getenv("SKILL_BALANCED_UPLOAD_ENABLED", "1") 
 SKILL_BALANCED_UPLOAD_TARGET = int(os.getenv("SKILL_BALANCED_UPLOAD_TARGET", "1500"))
 SKILL_BALANCED_UPLOAD_SEED = int(os.getenv("SKILL_BALANCED_UPLOAD_SEED", "42"))
 
-# Query categories (the Frozen Planner's taxonomy); must match ALLOWED_SKILLS in
-# train_examples/reward_function/cot_val.py, which reads the counts written here.
-ALLOWED_SKILLS = [
-    "causal",
-    "sequential",
-    "synchronous",
-    "bounded",
-    "static",
-    "dynamic",
-    "identity",
-    "negative",
-]
-SKILL_ALIASES = {skill: skill for skill in ALLOWED_SKILLS}
-
-
 def _log(msg):
     ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
     print(f"[upload {ts}] {msg}", flush=True)
-
-
-def normalize_skill_label(skill):
-    if skill is None:
-        return None
-    normalized = str(skill).strip().lower().replace("_", " ").replace("-", " ")
-    normalized = " ".join(normalized.split())
-    return SKILL_ALIASES.get(normalized)
-
-
-def count_skills(rows, key):
-    counts = Counter()
-    for row in rows:
-        normalized = normalize_skill_label(row.get(key))
-        if normalized:
-            counts[normalized] += 1
-        else:
-            counts["unknown"] += 1
-    return counts
-
-
-def apply_skill_balanced_sampling(rows, target_size, rng):
-    if not rows or target_size <= 0:
-        return rows, {
-            "requested_target": target_size,
-            "per_skill_quota": 0,
-            "selected_before_backfill": 0,
-            "backfill_count": 0,
-        }
-
-    per_skill_quota = max(target_size // len(ALLOWED_SKILLS), 0)
-    selected = []
-    selected_ids = set()
-
-    skill_to_rows = {skill: [] for skill in ALLOWED_SKILLS}
-    unknown_rows = []
-    for idx, row in enumerate(rows):
-        normalized = normalize_skill_label(row.get("declared_skill"))
-        if normalized in ALLOWED_SKILLS:
-            skill_to_rows[normalized].append((idx, row))
-        else:
-            unknown_rows.append((idx, row))
-
-    for skill in ALLOWED_SKILLS:
-        bucket = list(skill_to_rows[skill])
-        rng.shuffle(bucket)
-        chosen = bucket[:per_skill_quota]
-        selected.extend(row for _, row in chosen)
-        selected_ids.update(idx for idx, _ in chosen)
-
-    selected_before_backfill = len(selected)
-    if len(selected) < min(target_size, len(rows)):
-        remaining = [(idx, row) for idx, row in enumerate(rows) if idx not in selected_ids]
-        rng.shuffle(remaining)
-        need = min(target_size, len(rows)) - len(selected)
-        chosen_backfill = remaining[:need]
-        selected.extend(row for _, row in chosen_backfill)
-    else:
-        chosen_backfill = []
-
-    return selected, {
-        "requested_target": target_size,
-        "per_skill_quota": per_skill_quota,
-        "selected_before_backfill": selected_before_backfill,
-        "backfill_count": len(chosen_backfill),
-    }
 
 
 STORAGE_PATH = os.getenv("STORAGE_PATH")
@@ -160,16 +82,7 @@ def _log_multiple_choice_abcd_stats(rows, stage, question_key, type_key):
 _log_multiple_choice_abcd_stats(datas, "Before upload filtering", question_key="question", type_key="question_type")
 
 filtered_datas = [
-    {
-        'problem': data['question'],
-        'answer': data['answer'],
-        'score': data['score'],
-        'images': data.get('image', ''),
-        'problem_type': data.get('question_type', 'unknown'),
-        'declared_skill': normalize_skill_label(data.get('declared_skill')) or str(data.get('declared_skill', 'unknown')),
-        'skill_match': int(data.get('skill_match', 1)),
-        'valid': int(data.get('valid', 1)),
-    }
+    upload_row(data)
     for data in datas
     if data['score'] >= args.min_score
     and data['score'] <= args.max_score

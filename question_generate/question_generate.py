@@ -7,11 +7,11 @@ from vllm.outputs import RequestOutput
 import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from verl.utils.vllm_utils import VLLMHijack
+from question_evaluate.records import generated_record
 from video_verifier.prompts import (
     build_questioner_system_prompt,
     build_questioner_user_prompt,
     load_graph,
-    parse_questioner_output,
 )
 import glob
 import json
@@ -209,16 +209,7 @@ def main(args):
             continue
 
         for completion in completions:
-            response = completion.outputs[0].text
-            parsed = parse_questioner_output(response)
-            results.append({
-                "declared_category": parsed["category"] or "unknown",
-                # Empty when unparseable; evaluate.py drops empty questions.
-                "question": parsed["question"] or "",
-                "time_bounds": parsed["time_bounds"],
-                "graph_path": graph_path,
-                "raw_response": response,
-            })
+            results.append(generated_record(completion.outputs[0].text, graph_path))
 
     # Save results
     output_file = f"{STORAGE_PATH}/generated_question/{args.save_name}_{args.suffix}.json"
