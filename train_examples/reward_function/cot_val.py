@@ -43,6 +43,13 @@ DUPLICATE_PENALTY_WEIGHT = float(os.getenv("RISE_DUPLICATE_PENALTY_WEIGHT", "0.2
 
 TEMP_RESULTS_DIR = os.path.join(STORAGE_PATH, "temp_results")
 os.makedirs(TEMP_RESULTS_DIR, exist_ok=True)
+# Per-sample questioner rewards, one JSON line per sample, appended every call.
+# The batch-mean metrics can't express per-category reward, and the reward
+# server's *_results.json files are deleted after each step. Set to "" to disable.
+QUESTIONER_REWARD_LOG = os.getenv(
+    "QUESTIONER_REWARD_LOG", os.path.join(STORAGE_PATH, "questioner_rewards.jsonl")
+)
+_REWARD_CALL_COUNT = 0
 
 # The questioner's query categories (the Frozen Planner's taxonomy). Named
 # "skills" for continuity with RISE's skill-balance machinery.
@@ -261,6 +268,44 @@ def difficulty_from_candidates(candidate_scores):
     return sum(min(c, 1 - c) for c in candidate_scores) / len(candidate_scores)
 
 
+def log_category_rewards(results, scores, difficulty_results) -> None:
+    """Print mean reward per declared category and append per-sample rows to
+    QUESTIONER_REWARD_LOG."""
+    global _REWARD_CALL_COUNT
+    _REWARD_CALL_COUNT += 1
+    by_category = {}
+    for item, score_item in zip(results, scores):
+        by_category.setdefault(item.get("declared_skill") or "unknown", []).append(score_item)
+    print(f"[reward-by-category] call={_REWARD_CALL_COUNT} n={len(scores)}")
+    for category, items in sorted(by_category.items(), key=lambda kv: -len(kv[1])):
+        n = len(items)
+        mean = lambda key: sum(x[key] for x in items) / n
+        print(
+            f"[reward-by-category]   {category:<12} n={n:<3} "
+            f"overall={mean('overall'):+.4f} difficulty={mean('difficulty'):+.4f} "
+            f"validity={mean('validity'):.3f} category_match={mean('skill_match'):.3f} "
+            f"skill_bonus={mean('skill_balance_bonus'):.4f} candidates={mean('judged_candidates'):.1f}"
+        )
+    if not QUESTIONER_REWARD_LOG:
+        return
+    timestamp = time.time()
+    with open(QUESTIONER_REWARD_LOG, "a") as f:
+        for item, score_item, difficulty in zip(results, scores, difficulty_results):
+            row = {
+                "time": timestamp,
+                "pid": os.getpid(),
+                "call": _REWARD_CALL_COUNT,
+                "category": item.get("declared_skill"),
+                "question": item.get("question", ""),
+                "time_bounds": item.get("time_bounds"),
+                "graph_path": item.get("graph_path"),
+                "candidate_scores": difficulty.get("candidate_scores") or [],
+            }
+            # Drop the per-category one-hot indicators; "category" already says it.
+            row.update({k: v for k, v in score_item.items() if k not in {f"skill_{c}" for c in ALLOWED_SKILLS}})
+            f.write(json.dumps(row) + "\n")
+
+
 def compute_score(predicts: List[str], ground_truths: List[str], questions: List[str], description_answers: List[str], format_weight: float = 0.1, images: Optional[List[str]] = None) -> List[Dict[str, float]]:
     """Questioner reward. Each sample's ground_truth carries its video's graph
     path (the questioner parquet's answer column); images are unused."""
@@ -365,6 +410,7 @@ def compute_score(predicts: List[str], ground_truths: List[str], questions: List
         }
         score_item.update(skill_indicator_metrics)
         scores.append(score_item)
+    log_category_rewards(results, scores, difficulty_results)
     if QUESTIONER_DEBUG_SAMPLES > 0:
         debug_count = min(QUESTIONER_DEBUG_SAMPLES, len(scores))
         print(f"[questioner-debug] showing {debug_count}/{len(scores)} samples")
