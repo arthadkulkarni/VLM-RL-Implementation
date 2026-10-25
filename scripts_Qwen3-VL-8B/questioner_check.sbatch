@@ -66,5 +66,6 @@ bash scripts_Qwen3-VL-8B/questioner_train.sh "${BASE}" "${BASE}" q_check 2
 PYTHONPATH="$(pwd)${PYTHONPATH:+:${PYTHONPATH}}" CUDA_VISIBLE_DEVICES=0 \
   python3 scripts_Qwen3-VL-8B/questioner_drift_diag.py \
   --graph "$(ls "${GRAPH_DIR}"/*.json | head -1)" \
+  --reward_log "${STORAGE_PATH}/questioner_rewards.jsonl" \
   --models "base=${BASE}" "step2=${STORAGE_PATH}/models/q_check/global_step_2/actor/huggingface"
 echo "=== $(date) done ==="

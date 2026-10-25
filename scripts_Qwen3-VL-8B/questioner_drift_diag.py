@@ -1,43 +1,78 @@
 """Did questioner GRPO steps move the policy toward or away from its rewarded
-rollouts? For each checkpoint, score fixed step-1 rollouts (one rewarded -1,
-two rewarded ~+0.07), the category-token distribution, and the category mix of
-fresh samples on the same graph prompt.
+rollouts? Rescores the run's own rollouts (QUESTIONER_REWARD_LOG rows for
+--graph) under each checkpoint and checks that the change in log p from the
+first model follows each rollout's advantage. Also prints the first
+category-token distribution and the category mix of fresh samples.
 
-  python3 scripts_Qwen3-VL-8B/questioner_drift_diag.py --graph <graph.json> --models base=<dir> step2=<dir> ...
+  python3 scripts_Qwen3-VL-8B/questioner_drift_diag.py --graph <graph.json> \
+      --reward_log <questioner_rewards.jsonl> --models base=<dir> step2=<dir> ...
+
+Advantages are the reward z-scored over all rollouts of one reward call for
+this graph. The log has no GRPO uid (_balance_batch reorders the batch before
+reward), but rollouts of one prompt share a baseline in expectation, so the
+pooled score has the same sign as GRPO's per-group one on average. Rows logged
+before the "response" field existed are rebuilt from category/question/bounds.
 """
 
 import argparse
 import collections
+import json
+import os
 import re
+import statistics
 
 import torch
 from transformers import AutoModelForImageTextToText, AutoTokenizer
 
-from video_verifier.prompts import CATEGORIES, build_questioner_system_prompt, build_questioner_user_prompt, load_graph
+from video_verifier.prompts import CATEGORIES, build_questioner_system_prompt, build_questioner_user_prompt, fmt_time, load_graph
 
-# Step-1 rollouts from job 3317242's [questioner-debug] lines, with their reward.
-ROLLOUTS = {
-    "bounded(-1.00)": "<category>bounded</category>\n<question>What does the woman in the white shirt do while the man "
-    "in the dark jacket is shown eating and then leaning forward in distress?</question>",
-    "sequential(+0.07)a": "<category>sequential</category>\n<question>When does the woman in the white shirt first "
-    "appear in the shelter and tend to a sick person, and what happens immediately after?</question>",
-    "sequential(+0.08)b": "<category>sequential</category>\n<question>When does the woman in the white shirt first "
-    "tend to a wounded man in the shelter, and what happens immediately afterward?</question>",
-}
+
+def load_rollouts(reward_log, graph_path):
+    """[(call, response, advantage, category)] for one graph's logged rollouts."""
+    by_call = collections.defaultdict(list)
+    with open(reward_log) as f:
+        for line in f:
+            row = json.loads(line)
+            if os.path.abspath(row.get("graph_path") or "") == os.path.abspath(graph_path):
+                by_call[row["call"]].append(row)
+    rollouts = []
+    for call, rows in sorted(by_call.items()):
+        scores = [row["overall"] for row in rows]
+        mean, std = statistics.mean(scores), statistics.pstdev(scores)
+        for row in rows:
+            response = row.get("response")
+            if response is None:
+                response = f"<category>{row['category']}</category>\n<question>{row['question']}</question>"
+                if row.get("time_bounds"):
+                    start, end = row["time_bounds"]
+                    response += f"\n<time_bounds>{fmt_time(start)}, {fmt_time(end)}</time_bounds>"
+            rollouts.append((call, response, (row["overall"] - mean) / (std + 1e-6), row["category"]))
+    return rollouts
+
+
+def pearson(xs, ys):
+    mx, my = statistics.mean(xs), statistics.mean(ys)
+    cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    var = (sum((x - mx) ** 2 for x in xs) * sum((y - my) ** 2 for y in ys)) ** 0.5
+    return cov / var if var else 0.0
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--graph", required=True)
-    p.add_argument("--models", nargs="+", required=True, help="name=path")
+    p.add_argument("--reward_log", required=True, help="QUESTIONER_REWARD_LOG of the run that trained --models")
+    p.add_argument("--models", nargs="+", required=True, help="name=path; the first is the reference")
     p.add_argument("--num_samples", type=int, default=32)
     args = p.parse_args()
 
     graph = load_graph(args.graph)
+    rollouts = load_rollouts(args.reward_log, args.graph)
+    assert rollouts, f"no rows for {args.graph} in {args.reward_log}"
     messages = [
         {"role": "system", "content": build_questioner_system_prompt()},
         {"role": "user", "content": build_questioner_user_prompt(graph, 120)},
     ]
+    ref_logp = None
     for spec in args.models:
         name, path = spec.split("=", 1)
         tok = AutoTokenizer.from_pretrained(path)
@@ -46,14 +81,34 @@ def main():
         prompt_ids = tok(prompt, return_tensors="pt").input_ids.cuda()
         n_prompt = prompt_ids.shape[1]
 
-        print(f"\n=== {name}: {path} (prompt {n_prompt} tokens)")
+        print(f"\n=== {name}: {path} (prompt {n_prompt} tokens, {len(rollouts)} logged rollouts)")
         with torch.no_grad():
-            for label, resp in ROLLOUTS.items():
+            logp = []
+            for _, resp, _, _ in rollouts:
                 ids = tok(prompt + resp + tok.eos_token, return_tensors="pt").input_ids.cuda()
-                logp = torch.log_softmax(model(input_ids=ids).logits[0, :-1].float(), -1)
-                tgt = ids[0, 1:]
-                tok_lp = logp.gather(-1, tgt[:, None])[:, 0][n_prompt - 1:]
-                print(f"  logp {label:20s} total={tok_lp.sum().item():8.2f}  mean/token={tok_lp.mean().item():.3f}")
+                lp = torch.log_softmax(model(input_ids=ids).logits[0, n_prompt - 1 : -1].float(), -1)
+                logp.append(lp.gather(-1, ids[0, n_prompt:, None]).sum().item())
+            if ref_logp is None:
+                ref_logp = logp
+            else:
+                # The policy followed its rewards iff log p rose on adv > 0 rollouts and fell on adv < 0 ones.
+                for call in sorted({r[0] for r in rollouts}):
+                    idx = [i for i, r in enumerate(rollouts) if r[0] == call]
+                    adv = [rollouts[i][2] for i in idx]
+                    delta = [logp[i] - ref_logp[i] for i in idx]
+                    pos = [d for a, d in zip(adv, delta) if a > 0]
+                    neg = [d for a, d in zip(adv, delta) if a < 0]
+                    print(
+                        f"  step-{call} rollouts: corr(adv, dlogp)={pearson(adv, delta):+.3f}  "
+                        f"mean dlogp adv>0={statistics.mean(pos) if pos else float('nan'):+.2f} (n={len(pos)})  "
+                        f"adv<0={statistics.mean(neg) if neg else float('nan'):+.2f} (n={len(neg)})"
+                    )
+                by_cat = collections.defaultdict(list)
+                for (_, _, a, cat), d in zip(rollouts, (l - r for l, r in zip(logp, ref_logp))):
+                    by_cat[cat].append((a, d))
+                print("  by category (mean adv, mean dlogp): " + ", ".join(
+                    f"{c}=({statistics.mean(a for a, _ in v):+.2f}, {statistics.mean(d for _, d in v):+.2f})"
+                    for c, v in sorted(by_cat.items())))
 
             ids = tok(prompt + "<category>", return_tensors="pt").input_ids.cuda()
             probs = torch.softmax(model(input_ids=ids).logits[0, -1].float(), -1)

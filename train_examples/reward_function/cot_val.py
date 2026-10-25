@@ -299,6 +299,8 @@ def log_category_rewards(results, scores, difficulty_results) -> None:
                 "question": item.get("question", ""),
                 "time_bounds": item.get("time_bounds"),
                 "graph_path": item.get("graph_path"),
+                # The raw rollout text, so questioner_drift_diag.py can rescore it.
+                "response": item.get("response"),
                 "candidate_scores": difficulty.get("candidate_scores") or [],
             }
             # Drop the per-category one-hot indicators; "category" already says it.
@@ -313,11 +315,12 @@ def compute_score(predicts: List[str], ground_truths: List[str], questions: List
     results = []
     format_components = []
     skill_counts = get_recent_skill_counts() if (SKILL_AWARE_ENABLED and SKILL_BALANCE_ENABLED) else Counter()
-    for predict, graph_path in zip(predicts, ground_truths):
-        predict = re.sub(r"\s*(<|>|/)\s*", r"\1", predict)  # handle qwen2.5vl-32b format
+    for raw_predict, graph_path in zip(predicts, ground_truths):
+        predict = re.sub(r"\s*(<|>|/)\s*", r"\1", raw_predict)  # handle qwen2.5vl-32b format
         format_info = compute_format_components(predict)
         item = match(predict) or {"question": "", "declared_skill": None, "time_bounds": None}
         item["graph_path"] = str(graph_path)
+        item["response"] = raw_predict
         results.append(item)
         format_components.append(format_info)
 

@@ -1,6 +1,8 @@
 #!/bin/bash
-# Run questioner_drift_diag.py on the base model and the mini e2e run's
-# questioner checkpoints. Submit from the repo root.
+# Run questioner_drift_diag.py on the base model and a questioner run's
+# checkpoints. RUN is the run's STORAGE_PATH (it must hold
+# questioner_rewards.jsonl); Q and STEPS pick the checkpoints. Defaults to the
+# questioner_check.sbatch run. Submit from the repo root.
 #SBATCH --account=bffz-dtai-gh
 #SBATCH --partition=ghx4-interactive
 #SBATCH --nodes=1
@@ -16,10 +18,14 @@ source scripts_Qwen3-VL-8B/use_env.sh
 export PYTHONUNBUFFERED=1
 
 NVME_ROOT="${NVME_ROOT:-/work/nvme/bffz/akulkarni8/rise}"
-RUN="${NVME_ROOT}/storage_RISE_mini_e2e"
-Q="${RUN}/models/Qwen3-VL-8B-Instruct_q_b1"
+HDD_ROOT="${HDD_ROOT:-/work/hdd/bffz/akulkarni8/rise}"
+RUN="${RUN:-${HDD_ROOT}/storage_RISE_q_check_cat}"
+Q="${Q:-${RUN}/models/q_check}"
+models=("base=${NVME_ROOT}/pretrained_LM/Qwen3-VL-8B-Instruct")
+for step in ${STEPS:-2}; do
+  models+=("step${step}=${Q}/global_step_${step}/actor/huggingface")
+done
 PYTHONPATH="$(pwd)${PYTHONPATH:+:${PYTHONPATH}}" python3 scripts_Qwen3-VL-8B/questioner_drift_diag.py \
-  --graph "${RUN}/video_graphs/0032_order_322_t89_5min.json" \
-  --models "base=${NVME_ROOT}/pretrained_LM/Qwen3-VL-8B-Instruct" \
-           "step2=${Q}/global_step_2/actor/huggingface" \
-           "step4=${Q}/global_step_4/actor/huggingface"
+  --graph "$(ls "${RUN}"/video_graphs/*.json | head -1)" \
+  --reward_log "${RUN}/questioner_rewards.jsonl" \
+  --models "${models[@]}"
