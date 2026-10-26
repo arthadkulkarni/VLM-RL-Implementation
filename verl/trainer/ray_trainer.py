@@ -182,6 +182,31 @@ def compute_advantage(
 
 
 
+def log_update_batch(batch: DataProto, tokenizer, output_path, step, world_size):
+    """Append one row per rollout as update_actor will see it (RISE_UPDATE_LOG):
+    its batch position, which with world_size fixes the device and mini-batch
+    it lands in, its GRPO group (uid), score and sequence advantage, and the
+    response text. scripts_Qwen3-VL-8B/questioner_update_replay.py
+    replays the actor update from these rows."""
+    response_mask = batch.batch["response_mask"].bool()
+    scores = (batch.batch["token_level_scores"] * response_mask).sum(-1).tolist()
+    advantages = batch.batch["advantages"]
+    first = response_mask.float().argmax(-1)
+    seq_adv = advantages.gather(-1, first[:, None])[:, 0].tolist()
+    with open(output_path, "a", encoding="utf-8") as f:
+        for i in range(len(batch)):
+            ids = batch.batch["responses"][i][response_mask[i]].tolist()
+            f.write(json.dumps({
+                "step": step,
+                "position": i,
+                "world_size": world_size,
+                "uid": str(batch.non_tensor_batch["uid"][i]),
+                "score": scores[i],
+                "advantage": seq_adv[i],
+                "response": tokenizer.decode(ids, skip_special_tokens=True),
+            }, ensure_ascii=False) + "\n")
+
+
 # When validating, save the output responses to an output file
 def save_responses_for_validation(batch, tokenizer, output_path):
     output_path = Path(output_path)
@@ -730,6 +755,9 @@ class RayPPOTrainer:
                             lam=self.config.algorithm.lam,
                         )
                         metrics.update(advantage_metrics)
+                        if os.getenv("RISE_UPDATE_LOG"):
+                            log_update_batch(batch, self.tokenizer, os.environ["RISE_UPDATE_LOG"],
+                                             self.global_step, self.actor_rollout_wg.world_size)
 
                     # update critic
                     if self.use_critic:

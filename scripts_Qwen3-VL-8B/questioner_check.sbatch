@@ -68,4 +68,14 @@ PYTHONPATH="$(pwd)${PYTHONPATH:+:${PYTHONPATH}}" CUDA_VISIBLE_DEVICES=0 \
   --graph "$(ls "${GRAPH_DIR}"/*.json | head -1)" \
   --reward_log "${STORAGE_PATH}/questioner_rewards.jsonl" \
   --models "base=${BASE}" "step2=${STORAGE_PATH}/models/q_check/global_step_2/actor/huggingface"
+
+# With RISE_UPDATE_LOG set, the trainer logged what each actor update saw;
+# replay step 1's update from the base model and compare with step 2's rollouts.
+if [ -n "${RISE_UPDATE_LOG:-}" ]; then
+  PYTHONPATH="$(pwd)${PYTHONPATH:+:${PYTHONPATH}}" python3 scripts_Qwen3-VL-8B/questioner_update_replay.py \
+    --update_log "${RISE_UPDATE_LOG}" \
+    --graph "$(ls "${GRAPH_DIR}"/*.json | head -1)" \
+    --model "${BASE}" \
+    --mini_batch $(( RISE_GLOBAL_BATCH_SIZE * RISE_ROLLOUT_N / (RISE_NUM_GPUS / 2) ))
+fi
 echo "=== $(date) done ==="
