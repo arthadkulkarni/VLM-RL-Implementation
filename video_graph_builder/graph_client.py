@@ -16,6 +16,8 @@ os.makedirs(TEMP_RESULTS_DIR, exist_ok=True)
 CAPTION_REQUEST_RETRIES = int(os.getenv("CAPTION_REQUEST_RETRIES", "12"))
 CAPTION_REQUEST_RETRY_SLEEP_SEC = float(os.getenv("CAPTION_REQUEST_RETRY_SLEEP_SEC", "5"))
 CAPTION_SERVER_BASE_PORT = int(os.getenv("RISE_CAPTION_SERVER_BASE_PORT", "6000"))
+# How long to wait for a task the server already took after its request timed out.
+GRAPH_RESULT_WAIT_SEC = float(os.getenv("RISE_GRAPH_RESULT_WAIT_SEC", str(6 * 3600)))
 
 
 def generate_temp_filename(prefix="caption", suffix=".json"):
@@ -30,6 +32,18 @@ def split_list(items, n):
     return [items[i * k + min(i, m):(i + 1) * k + min(i + 1, m)] for i in range(n)]
 
 
+def wait_for_results(path, endpoint, port):
+    result_path = path.replace(".json", "_results.json")
+    print(f"[graph-client] endpoint={endpoint} port={port} still running {path}; waiting for {result_path}")
+    deadline = time.time() + GRAPH_RESULT_WAIT_SEC
+    while time.time() < deadline:
+        if os.path.exists(result_path):
+            time.sleep(5)  # the server writes it with one json.dump; let it finish
+            return True
+        time.sleep(30)
+    raise TimeoutError(f"no {result_path} after {GRAPH_RESULT_WAIT_SEC:.0f}s")
+
+
 def fetch(port, path, endpoint="caption_entities"):
     url = f"http://127.0.0.1:{port}/{endpoint}"
     last_exc = None
@@ -40,6 +54,11 @@ def fetch(port, path, endpoint="caption_entities"):
             return True
         except requests.RequestException as exc:
             last_exc = exc
+            if not os.path.exists(path):
+                # The server deletes the task file once it reads it, so a
+                # resend can only 500 (job 3360025: a /same_entity batch
+                # outlived the read timeout). Wait for its results instead.
+                return wait_for_results(path, endpoint, port)
             if attempt >= CAPTION_REQUEST_RETRIES:
                 break
             print(
