@@ -30,7 +30,10 @@ ALLOWED_SKILLS = [
 SKILL_ALIASES = {skill: skill for skill in ALLOWED_SKILLS}
 
 
-def generated_record(response, graph_path):
+def generated_record(response, graph_path, focus_unit=None):
+    """One questioner completion. focus_unit is the focus window a long
+    video's prompt showed in full (None otherwise); evaluate.py's validity
+    judge is shown the same view."""
     parsed = parse_questioner_output(response)
     return {
         "declared_category": parsed["category"] or "unknown",
@@ -38,6 +41,7 @@ def generated_record(response, graph_path):
         "question": parsed["question"] or "",
         "time_bounds": parsed["time_bounds"],
         "graph_path": graph_path,
+        "focus_unit": focus_unit,
         "raw_response": response,
     }
 
@@ -56,6 +60,7 @@ def structural_query_item(item):
         "declared_category": category or str(item.get("declared_category") or "unknown"),
         "time_bounds": item.get("time_bounds"),
         "graph_path": item.get("graph_path", ""),
+        "focus_unit": item.get("focus_unit"),
         "category_match": 0,
         "valid": 0,
         "validity_reason": "",

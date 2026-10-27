@@ -22,6 +22,8 @@ import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from collections import Counter
+
+from video_verifier.prompts import split_graph_ref
 STORAGE_PATH = os.getenv("STORAGE_PATH")
 if STORAGE_PATH is None:
     STORAGE_PATH = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -299,9 +301,11 @@ def log_category_rewards(results, scores, difficulty_results) -> None:
                 "question": item.get("question", ""),
                 "time_bounds": item.get("time_bounds"),
                 "graph_path": item.get("graph_path"),
+                "focus_unit": item.get("focus_unit"),
                 # The raw rollout text, so questioner_drift_diag.py can rescore it.
                 "response": item.get("response"),
                 "candidate_scores": difficulty.get("candidate_scores") or [],
+                "coarse_scores": difficulty.get("coarse_scores") or [],
             }
             # Drop the per-category one-hot indicators; "category" already says it.
             row.update({k: v for k, v in score_item.items() if k not in {f"skill_{c}" for c in ALLOWED_SKILLS}})
@@ -309,8 +313,9 @@ def log_category_rewards(results, scores, difficulty_results) -> None:
 
 
 def compute_score(predicts: List[str], ground_truths: List[str], questions: List[str], description_answers: List[str], format_weight: float = 0.1, images: Optional[List[str]] = None) -> List[Dict[str, float]]:
-    """Questioner reward. Each sample's ground_truth carries its video's graph
-    path (the questioner parquet's answer column); images are unused."""
+    """Questioner reward. Each sample's ground_truth carries its video's
+    graph_ref (the questioner parquet's answer column: graph path, plus the
+    focus unit for a long video); images are unused."""
     print("Computing rewards")
     results = []
     format_components = []
@@ -319,7 +324,7 @@ def compute_score(predicts: List[str], ground_truths: List[str], questions: List
         predict = re.sub(r"\s*(<|>|/)\s*", r"\1", raw_predict)  # handle qwen2.5vl-32b format
         format_info = compute_format_components(predict)
         item = match(predict) or {"question": "", "declared_skill": None, "time_bounds": None}
-        item["graph_path"] = str(graph_path)
+        item["graph_path"], item["focus_unit"] = split_graph_ref(graph_path)
         item["response"] = raw_predict
         results.append(item)
         format_components.append(format_info)
@@ -330,6 +335,8 @@ def compute_score(predicts: List[str], ground_truths: List[str], questions: List
             "declared_category": item.get("declared_skill"),
             "time_bounds": item.get("time_bounds"),
             "graph_path": item["graph_path"],
+            # the window a long video's prompt showed in full; the validity judge sees the same view
+            "focus_unit": item.get("focus_unit"),
         }
 
     gated_indices = [
@@ -409,6 +416,14 @@ def compute_score(predicts: List[str], ground_truths: List[str], questions: List
             "difficulty": difficulty_score,
             "penalty": penalty,
             "num_candidates": float(difficulty_results[i].get("num_candidates", 0)),
+            # Coarse-to-fine search (RISE_HIERARCHICAL_SEARCH on the reward
+            # servers): |C(x, q)| before the search, and units judged / accepted.
+            "planned_candidates": float(difficulty_results[i].get("planned_candidates", 0)),
+            "coarse_units": float(difficulty_results[i].get("num_units", 0)),
+            "accepted_units": float(difficulty_results[i].get("accepted_units", 0)),
+            # Verifier judgments drawn for this query (coarse + fine; fewer
+            # than G per candidate under RISE_VERIFIER_INITIAL_SAMPLES).
+            "verifier_samples": float(difficulty_results[i].get("verifier_samples", 0)),
             "judged_candidates": float(len(candidate_scores)),
         }
         score_item.update(skill_indicator_metrics)

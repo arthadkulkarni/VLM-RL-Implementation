@@ -13,6 +13,8 @@ from video_verifier.prompts import (
     build_questioner_system_prompt,
     build_questioner_user_prompt,
     load_graph,
+    focus_windows,
+    needs_focus,
 )
 import glob
 import json
@@ -176,6 +178,11 @@ def main(args):
         stop_token_ids=[tokenizer.eos_token_id],
     )
 
+    # A long video's prompt shows one focus window in full (build_graph_context);
+    # which one is drawn per sample, seeded by this shard, so repeated samples
+    # of a video ask about different parts of it.
+    focus_rng = random.Random(f"{args.suffix}:{start_index}")
+
     # Process each sampled video graph
     results = []
     target_count = len(sample_indices)
@@ -189,9 +196,12 @@ def main(args):
             print(f"Failed to load graph {graph_path}: {e}")
             continue
 
+        focus_unit = (
+            focus_rng.randrange(len(focus_windows(graph))) if needs_focus(graph, args.max_context_segments) else None
+        )
         prompt = (
             f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-            f"<|im_start|>user\n{build_questioner_user_prompt(graph, args.max_context_segments)}<|im_end|>\n"
+            f"<|im_start|>user\n{build_questioner_user_prompt(graph, args.max_context_segments, focus_unit)}<|im_end|>\n"
             "<|im_start|>assistant\n"
         )
 
@@ -213,7 +223,7 @@ def main(args):
             continue
 
         for completion in completions:
-            results.append(generated_record(completion.outputs[0].text, graph_path))
+            results.append(generated_record(completion.outputs[0].text, graph_path, focus_unit))
 
     # Save results
     output_file = f"{STORAGE_PATH}/generated_question/{args.save_name}_{args.suffix}.json"

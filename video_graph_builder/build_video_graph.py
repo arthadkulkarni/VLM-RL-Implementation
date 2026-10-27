@@ -18,6 +18,7 @@ from video_graph_builder.entity_linker import (
 )
 from video_graph_builder.graph_client import caption_entities_batch, same_entity_batch
 from video_graph_builder.montage import build_montage, sample_frame_indices
+from video_graph_builder.part_summaries import summarize_graphs
 from video_graph_builder.segmenter import (
     merge_short_segments,
     build_segment_hierarchy,
@@ -240,7 +241,7 @@ def caption_and_link(videos, num_servers, base_port, link_window_sec, max_reid_p
     return stats
 
 
-def assemble_graph(video_id, fps, segments, entities, timeline):
+def assemble_graph(video_id, fps, segments, entities, timeline, parts=None):
     edges = []
     seen_adjacent = set()
 
@@ -271,7 +272,7 @@ def assemble_graph(video_id, fps, segments, entities, timeline):
                 "entity_id": entity_id,
             })
 
-    return {
+    graph = {
         "video_id": video_id,
         "fps": fps,
         "timeline": timeline,
@@ -279,6 +280,9 @@ def assemble_graph(video_id, fps, segments, entities, timeline):
         "entities": entities,
         "edges": edges,
     }
+    if parts is not None:
+        graph["parts"] = parts
+    return graph
 
 
 def save_montages(segments, out_dir, video_id):
@@ -362,6 +366,13 @@ def main():
         help="Stage-2 entity re-identification: cap on tracklet pairs judged per video. Every "
         "same-type pair is judged below the cap; a warning is printed when it is hit.",
     )
+    parser.add_argument(
+        "--part_summaries",
+        type=int,
+        default=1,
+        help="1 = summarize each Planner coarse unit's captions into graph['parts'] (the long-video "
+        "overview the questioner sees); 0 = skip. Backfill old graphs with video_graph_builder.part_summaries.",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument(
         "--overwrite",
@@ -413,8 +424,20 @@ def main():
                 failed.extend(video["video_path"] for video in prepared)
                 continue
 
+            if args.part_summaries:
+                # One text-only round over every part of the batch's videos (part_summaries.py).
+                summary_start = time.time()
+                try:
+                    n_parts = summarize_graphs(prepared, args.num_servers, args.base_port)
+                    stats["summarize"] = (time.time() - summary_start, n_parts)
+                except Exception as e:
+                    print(f"[video-graph] WARNING part summaries failed for batch {b + 1}, graphs saved without: {e}")
+
             for video in prepared:
-                graph = assemble_graph(video["video_id"], args.fps, video["segments"], video["entities"], video["timeline"])
+                graph = assemble_graph(
+                    video["video_id"], args.fps, video["segments"], video["entities"], video["timeline"],
+                    video.get("parts"),
+                )
                 out_path = os.path.join(args.out_dir, f"{graph['video_id']}.json")
                 with open(out_path, "w") as f:
                     json.dump(graph, f, indent=2)

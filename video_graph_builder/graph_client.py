@@ -131,3 +131,15 @@ def same_entity_batch(pairs, montages, num_servers, base_port=None):
             "pairs": shard,
         })
     return _run_shards(payloads, base_port, "same_entity")
+
+
+def summarize_parts_batch(items, num_servers, base_port=None):
+    """items: part_summaries.part_requests dicts ({"part_id", "span",
+    "captions", "entity_names", ...}). Shards them across the
+    /summarize_parts servers; returns [{"part_id", "summary"}] (key by
+    part_id)."""
+    if not items:
+        return []
+    base_port = base_port if base_port is not None else CAPTION_SERVER_BASE_PORT
+    shards = split_list(items, max(1, min(num_servers, len(items))))
+    return _run_shards(shards, base_port, "summarize_parts")

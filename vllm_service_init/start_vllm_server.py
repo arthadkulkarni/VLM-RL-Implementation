@@ -7,7 +7,7 @@ Endpoints used by the questioner reward (train_examples/reward_function/cot_val.
     /judge_validity  temperature-0 validity + category judge over the video graph
     /hello           per-candidate Verifier sampling: for each query, every Planner
                      candidate is judged G times, returning its consistency c_i
-Endpoints used by video_graph_builder: /caption_entities, /same_entity.
+Endpoints used by video_graph_builder: /caption_entities, /same_entity, /summarize_parts.
 
 Prompts are shared with question_evaluate/evaluate.py via video_verifier.prompts.
 
@@ -33,16 +33,20 @@ from verl.utils.lora_utils import adapter_from_env, vllm_adapter
 from verl.utils.vllm_utils import VLLMHijack
 from video_graph_builder.montage import stack_montages
 from video_graph_builder.parsing import parse_caption_entities
-from frozen_planner.planner import plan
+from video_graph_builder.part_summaries import build_summary_prompt, parse_summary
+from frozen_planner.planner import PlannerConfig, coarse_units, plan, within_units
+from video_verifier import scoring
 from video_verifier.prompts import (
     build_candidate_problem,
-    build_candidate_prompt,
+    build_coarse_problem,
+    coarse_unit_image,
     build_graph_context,
     build_validity_prompt,
     candidate_image,
     evenly_spaced,
     extract_category_match,
     load_graph,
+    needs_more_votes,
     normalize_category,
     parse_binary,
     tally_votes,
@@ -50,6 +54,32 @@ from video_verifier.prompts import (
 
 # /hello judges at most this many candidates per query (evenly spaced over C(x, q)).
 MAX_CANDIDATES = int(os.getenv("RISE_MAX_CANDIDATES", "64"))
+# Coarse-to-fine search: when C(x, q) exceeds MAX_CANDIDATES, judge the
+# Planner's coarse units first and only the candidates inside units with
+# consistency >= RISE_COARSE_ACCEPT, instead of an evenly spaced subset that
+# on a long video rarely contains the queried moment.
+HIERARCHICAL_SEARCH = os.getenv("RISE_HIERARCHICAL_SEARCH", "0") == "1"
+COARSE_ACCEPT = float(os.getenv("RISE_COARSE_ACCEPT", "0.5"))
+COARSE_IMAGE_SEGMENTS = int(os.getenv("RISE_COARSE_IMAGE_SEGMENTS", "6"))
+# G: Verifier judgments sampled per candidate (RISE_VERIFIER_SAMPLES) and per
+# coarse unit (RISE_COARSE_SAMPLES; the coarse pass only filters, so fewer do).
+# Adaptive sampling: with RISE_VERIFIER_INITIAL_SAMPLES=k (0 < k < G), draw k
+# first and the remaining G - k only if those k disagree (needs_more_votes).
+# Replaying job 3444695's votes, k=4 halves the samples and keeps questioner
+# advantages at corr ~0.87 with full G=10 (k=5: 60% of the samples, ~0.91).
+# RISE_VERIFIER_MODE picks how a judgment becomes c_i (video_verifier/scoring.py):
+# sample (G sampled judgments, the default), direct (one forced-answer token,
+# c_i = P(1)), greedy (one temperature-0 judgment, P(1) at its answer). The
+# sample counts and adaptive sampling below only apply to `sample`.
+VERIFIER_MODE = os.getenv("RISE_VERIFIER_MODE", "sample")
+assert VERIFIER_MODE in scoring.MODES, f"RISE_VERIFIER_MODE={VERIFIER_MODE!r}, expected one of {scoring.MODES}"
+VERIFIER_SAMPLES = int(os.getenv("RISE_VERIFIER_SAMPLES", "10"))
+COARSE_SAMPLES = int(os.getenv("RISE_COARSE_SAMPLES", str(VERIFIER_SAMPLES)))
+INITIAL_SAMPLES = int(os.getenv("RISE_VERIFIER_INITIAL_SAMPLES", "0"))
+PLANNER_CONFIG = PlannerConfig(
+    coarse_min_sec=float(os.getenv("RISE_COARSE_MIN_SEC", "60")),
+    max_coarse_units=int(os.getenv("RISE_MAX_COARSE_UNITS", "32")),
+)
 # /judge_validity lists at most this many timeline segments in the graph context.
 MAX_CONTEXT_SEGMENTS = int(os.getenv("RISE_MAX_CONTEXT_SEGMENTS", "120"))
 CANDIDATE_MAX_PIXELS = int(os.getenv("RISE_CANDIDATE_MAX_PIXELS", "2097152"))
@@ -97,17 +127,18 @@ model = vllm.LLM(
     **LORA_KWARGS,
 )
 
-sample_params = vllm.SamplingParams(
-    max_tokens=2048,
-    temperature=1.0,
-    top_p=1.0,
-    top_k=40,
-    stop_token_ids=[tokenizer.eos_token_id],
-    n=10, # G: Verifier judgments sampled per candidate
-)
-
 judge_sample_params = vllm.SamplingParams(
     max_tokens=256,
+    temperature=0.0,
+    top_p=1.0,
+    top_k=-1,
+    stop_token_ids=[tokenizer.eos_token_id],
+    n=1,
+)
+
+# Part summaries are deterministic: the same captions give the same overview.
+summary_sample_params = vllm.SamplingParams(
+    max_tokens=160,
     temperature=0.0,
     top_p=1.0,
     top_k=-1,
@@ -236,7 +267,7 @@ def generate_with_fallback(name, batch_name, prompts, sampling_params, batch_ite
 
     outputs = []
     total = len(prompts)
-    chunk_size = args.hello_batch_size if batch_name == "hello" else len(prompts)
+    chunk_size = args.hello_batch_size if batch_name.startswith("hello") else len(prompts)
     total_batches = (total + chunk_size - 1) // chunk_size
 
     for batch_idx, batch_start in enumerate(range(0, total, chunk_size), start=1):
@@ -274,12 +305,60 @@ def generate_with_fallback(name, batch_name, prompts, sampling_params, batch_ite
                     outputs.append(None)
     return outputs
 
+def judge_consistency(name, batch_name, prompts, samples):
+    """prompts: [(chat, log_item)]. Judges each prompt per VERIFIER_MODE --
+    in `sample` mode `samples` judgments, adaptively when INITIAL_SAMPLES is
+    set (see its comment) -- and returns [(consistency, judgments drawn)] per
+    prompt; consistency is None when generation failed or no judgment parsed."""
+    if not prompts:
+        return []
+    chats = [chat for chat, _ in prompts]
+    items = [{'prompt_index': i, **item} for i, (_, item) in enumerate(prompts)]
+    stop = [tokenizer.eos_token_id]
+    if VERIFIER_MODE != 'sample':
+        with generation_lock:
+            responses = generate_with_fallback(
+                name, batch_name, chats, scoring.sampling_params(VERIFIER_MODE, 1, stop), items, use_tqdm=True,
+            )
+        return [scoring.score_output(VERIFIER_MODE, response) for response in responses]
+
+    initial = INITIAL_SAMPLES if 0 < INITIAL_SAMPLES < samples else samples
+    with generation_lock:
+        responses = generate_with_fallback(
+            name, batch_name, chats, scoring.sampling_params('sample', initial, stop), items, use_tqdm=True,
+        )
+    texts = [None if response is None else [out.text for out in response.outputs] for response in responses]
+
+    more = [i for i, t in enumerate(texts) if t is not None and initial < samples and needs_more_votes(t, initial)]
+    if more:
+        print(f'[server] /{batch_name} adaptive: {len(more)}/{len(prompts)} prompts split after {initial}, '
+              f'sampling {samples - initial} more')
+        with generation_lock:
+            extra = generate_with_fallback(
+                name, batch_name, [chats[i] for i in more], scoring.sampling_params('sample', samples - initial, stop),
+                [items[i] for i in more], use_tqdm=True,
+            )
+        for i, response in zip(more, extra):
+            if response is not None:
+                texts[i] += [out.text for out in response.outputs]
+    return [(None, 0) if t is None else (tally_votes(t)[1], len(t)) for t in texts]
+
+
+def image_chat(problem, image):
+    return {'prompt': scoring.verifier_prompt(problem, VERIFIER_MODE), 'multi_modal_data': {'image': image}}
+
+
 @app.route('/hello', methods=['GET'])
 def hello():
     '''Questioner difficulty signal: for each query, the Planner enumerates C(x, q),
     each candidate is judged G times, and the per-candidate consistency c_i
     (fraction of parseable judgments that accept) is returned as candidate_scores.
-    cot_val.py turns these into d(x, q).'''
+    cot_val.py turns these into d(x, q).
+
+    With RISE_HIERARCHICAL_SEARCH=1, a query whose C(x, q) exceeds
+    MAX_CANDIDATES is searched coarse-to-fine: its coarse units are judged first
+    (coarse_scores), and candidate_scores covers only candidates inside
+    accepted units. Otherwise C(x, q) is cut to an evenly spaced subset.'''
 
     # --- Pause the GPU idle worker to free up resources ---
     pause_event.set()
@@ -297,11 +376,18 @@ def hello():
             'question': item.get('question', ''),
             'candidate_scores': [],
             'num_candidates': 0,
+            'planned_candidates': 0,
+            'coarse_scores': [],
+            'num_units': 0,
+            'accepted_units': 0,
+            'verifier_samples': 0,
             'reason': '',
         }
         for item in data
     ]
-    chats, chat_items, owners = [], [], []
+    # Per query: (graph, category, C(x, q), coarse units to judge or None).
+    planned = {}
+    coarse_prompts, coarse_owners = [], []
     for idx, item in enumerate(data):
         question = item.get('question', '')
         category = normalize_category(item.get('declared_category'))
@@ -310,40 +396,73 @@ def hello():
             continue
         try:
             graph = load_graph(item.get('graph_path', ''))
-            candidates = plan(graph, {'category': category, 'time_bounds': item.get('time_bounds')})
+            candidates = plan(graph, {'category': category, 'time_bounds': item.get('time_bounds')}, PLANNER_CONFIG)
         except Exception as e:
             results_all[idx]['reason'] = f'planning failed: {e}'
             continue
+        results_all[idx]['planned_candidates'] = len(candidates)
+        units = None
+        if HIERARCHICAL_SEARCH and len(candidates) > MAX_CANDIDATES:
+            units = coarse_units(graph, PLANNER_CONFIG)
+            results_all[idx]['num_units'] = len(units)
+            for unit in units:
+                try:
+                    image = coarse_unit_image(
+                        item['graph_path'], graph, unit, COARSE_IMAGE_SEGMENTS,
+                        max_pixels=CANDIDATE_MAX_PIXELS, min_pixels=CANDIDATE_MIN_PIXELS,
+                    )
+                except Exception as e:
+                    print(f"[server][warning] skipping coarse unit {unit['unit_id']}: {e}")
+                    continue
+                coarse_prompts.append((
+                    image_chat(build_coarse_problem(question, category, unit, graph), image),
+                    {'question': question, 'unit_id': unit['unit_id']},
+                ))
+                coarse_owners.append((idx, unit))
+        planned[idx] = (graph, category, candidates, units)
+
+    accepted = {idx: [] for idx, (_, _, _, units) in planned.items() if units is not None}
+    if coarse_prompts:
+        print(f'[server] Coarse pass: {len(coarse_prompts)} unit prompts for {len(accepted)} queries.')
+        coarse_results = judge_consistency(name, 'hello_coarse', coarse_prompts, COARSE_SAMPLES)
+        for (idx, unit), (consistency, drawn) in zip(coarse_owners, coarse_results):
+            results_all[idx]['verifier_samples'] += drawn
+            if consistency is None:
+                continue
+            results_all[idx]['coarse_scores'].append(consistency)
+            if consistency >= COARSE_ACCEPT:
+                accepted[idx].append(unit)
+
+    fine_prompts, fine_owners = [], []
+    for idx, (graph, category, candidates, units) in planned.items():
+        if units is not None:
+            results_all[idx]['accepted_units'] = len(accepted[idx])
+            candidates = within_units(candidates, accepted[idx])
         candidates = evenly_spaced(candidates, MAX_CANDIDATES)
         results_all[idx]['num_candidates'] = len(candidates)
+        question = data[idx]['question']
         for candidate in candidates:
             try:
                 image = candidate_image(
-                    item['graph_path'], graph, candidate,
+                    data[idx]['graph_path'], graph, candidate,
                     max_pixels=CANDIDATE_MAX_PIXELS, min_pixels=CANDIDATE_MIN_PIXELS,
                 )
             except Exception as e:
                 print(f"[server][warning] skipping candidate {candidate['candidate_id']}: {e}")
                 continue
-            problem = build_candidate_problem(question, candidate, graph)
-            chats.append({'prompt': build_candidate_prompt(problem), 'multi_modal_data': {'image': image}})
-            chat_items.append({
-                'prompt_index': len(chat_items),
-                'question': question,
-                'candidate_id': candidate['candidate_id'],
-                'image_size': {'width': image.width, 'height': image.height},
-            })
-            owners.append(idx)
-    print(f'[server] Prepared {len(chats)} candidate prompts for {len(data)} queries.')
+            fine_prompts.append((
+                image_chat(build_candidate_problem(question, candidate, graph), image),
+                {
+                    'question': question,
+                    'candidate_id': candidate['candidate_id'],
+                    'image_size': {'width': image.width, 'height': image.height},
+                },
+            ))
+            fine_owners.append(idx)
+    print(f'[server] Prepared {len(fine_prompts)} candidate prompts for {len(data)} queries.')
 
-    with generation_lock:
-        responses = generate_with_fallback(name, 'hello', chats, sample_params, chat_items, use_tqdm=True)
-    print('[server] Generation completed.')
-
-    for idx, response in zip(owners, responses):
-        if response is None:
-            continue
-        _, consistency = tally_votes([out.text for out in response.outputs])
+    for idx, (consistency, drawn) in zip(fine_owners, judge_consistency(name, 'hello', fine_prompts, VERIFIER_SAMPLES)):
+        results_all[idx]['verifier_samples'] += drawn
         if consistency is not None:
             results_all[idx]['candidate_scores'].append(consistency)
     print('[server] All results have been processed.')
@@ -398,7 +517,8 @@ def judge_validity():
             continue
         valid_chats.append({
             'prompt': build_validity_prompt(
-                question, category, item.get('time_bounds'), build_graph_context(graph, MAX_CONTEXT_SEGMENTS)
+                question, category, item.get('time_bounds'),
+                build_graph_context(graph, MAX_CONTEXT_SEGMENTS, item.get('focus_unit')),
             ),
         })
         valid_chat_items.append({'prompt_index': idx, 'question': question, 'declared_category': category})
@@ -465,6 +585,41 @@ def build_same_entity_chat(pair_img, mention_a, mention_b):
         "<|im_start|>assistant\n"
     )
     return {"prompt": prompt, "multi_modal_data": {"image": pair_img}}
+
+@app.route('/summarize_parts', methods=['GET'])
+def summarize_parts():
+    '''Graph build: one text-only summary per video part (a Planner coarse
+    unit) from its segment captions; see video_graph_builder/part_summaries.py.'''
+    pause_event.set()
+    torch.cuda.synchronize()
+
+    name = request.args.get('name', 'None')
+    print(f'[server] Received summarize_parts request for task file: {name}')
+    with open(name, 'r') as f:
+        data = json.load(f)
+    os.remove(name)
+
+    chats = [{'prompt': build_summary_prompt(item)} for item in data]
+    items = [{'prompt_index': i, 'part_id': item.get('part_id', '')} for i, item in enumerate(data)]
+    responses = []
+    if chats:
+        with generation_lock:
+            responses = generate_with_fallback(name, 'summarize_parts', chats, summary_sample_params, items, use_tqdm=True)
+    results_all = [
+        {
+            'part_id': item.get('part_id', ''),
+            'summary': parse_summary(response.outputs[0].text) if response is not None and response.outputs else '',
+        }
+        for item, response in zip(data, responses)
+    ]
+
+    out_path = name.replace('.json', '_results.json')
+    with open(out_path, 'w') as f:
+        json.dump(results_all, f, indent=4)
+    pause_event.clear()
+    print(f'[server] Processed summarize_parts {name}: {len(results_all)} parts, results saved to {out_path}.')
+    return jsonify({'message': f'Processed {name}, results saved to {out_path}.'})
+
 
 @app.route('/caption_entities', methods=['GET'])
 def caption_entities():

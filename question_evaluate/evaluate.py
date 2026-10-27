@@ -220,7 +220,7 @@ if SUPERVISOR_VALIDITY_ENABLED:
                 item["question"],
                 item["declared_category"],
                 item["time_bounds"],
-                build_graph_context(load_graph(item["graph_path"]), args.max_context_segments),
+                build_graph_context(load_graph(item["graph_path"]), args.max_context_segments, item.get("focus_unit")),
             ),
         }
         for item in eligible_items
