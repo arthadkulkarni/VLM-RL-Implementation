@@ -16,6 +16,8 @@ os.makedirs(TEMP_RESULTS_DIR, exist_ok=True)
 CAPTION_REQUEST_RETRIES = int(os.getenv("CAPTION_REQUEST_RETRIES", "12"))
 CAPTION_REQUEST_RETRY_SLEEP_SEC = float(os.getenv("CAPTION_REQUEST_RETRY_SLEEP_SEC", "5"))
 CAPTION_SERVER_BASE_PORT = int(os.getenv("RISE_CAPTION_SERVER_BASE_PORT", "6000"))
+# How long to wait for a task the server already took after its request timed out.
+GRAPH_RESULT_WAIT_SEC = float(os.getenv("RISE_GRAPH_RESULT_WAIT_SEC", str(6 * 3600)))
 
 
 def generate_temp_filename(prefix="caption", suffix=".json"):
@@ -30,6 +32,18 @@ def split_list(items, n):
     return [items[i * k + min(i, m):(i + 1) * k + min(i + 1, m)] for i in range(n)]
 
 
+def wait_for_results(path, endpoint, port):
+    result_path = path.replace(".json", "_results.json")
+    print(f"[graph-client] endpoint={endpoint} port={port} still running {path}; waiting for {result_path}")
+    deadline = time.time() + GRAPH_RESULT_WAIT_SEC
+    while time.time() < deadline:
+        if os.path.exists(result_path):
+            time.sleep(5)  # the server writes it with one json.dump; let it finish
+            return True
+        time.sleep(30)
+    raise TimeoutError(f"no {result_path} after {GRAPH_RESULT_WAIT_SEC:.0f}s")
+
+
 def fetch(port, path, endpoint="caption_entities"):
     url = f"http://127.0.0.1:{port}/{endpoint}"
     last_exc = None
@@ -40,6 +54,11 @@ def fetch(port, path, endpoint="caption_entities"):
             return True
         except requests.RequestException as exc:
             last_exc = exc
+            if not os.path.exists(path):
+                # The server deletes the task file once it reads it, so a
+                # resend can only 500 (job 3360025: a /same_entity batch
+                # outlived the read timeout). Wait for its results instead.
+                return wait_for_results(path, endpoint, port)
             if attempt >= CAPTION_REQUEST_RETRIES:
                 break
             print(
@@ -112,3 +131,15 @@ def same_entity_batch(pairs, montages, num_servers, base_port=None):
             "pairs": shard,
         })
     return _run_shards(payloads, base_port, "same_entity")
+
+
+def summarize_parts_batch(items, num_servers, base_port=None):
+    """items: part_summaries.part_requests dicts ({"part_id", "span",
+    "captions", "entity_names", ...}). Shards them across the
+    /summarize_parts servers; returns [{"part_id", "summary"}] (key by
+    part_id)."""
+    if not items:
+        return []
+    base_port = base_port if base_port is not None else CAPTION_SERVER_BASE_PORT
+    shards = split_list(items, max(1, min(num_servers, len(items))))
+    return _run_shards(shards, base_port, "summarize_parts")

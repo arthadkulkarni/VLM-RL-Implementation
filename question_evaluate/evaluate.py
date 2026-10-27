@@ -44,8 +44,9 @@ from io import BytesIO
 import sys
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from verl.utils.lora_utils import adapter_from_env, vllm_adapter
 from verl.utils.vllm_utils import VLLMHijack
-from frozen_planner.planner import plan
+from question_evaluate.records import candidate_result_row, structural_query_item
 from video_verifier.prompts import (
     build_candidate_problem,
     build_candidate_prompt,
@@ -55,11 +56,12 @@ from video_verifier.prompts import (
     evenly_spaced,
     extract_category_match,
     load_graph,
-    normalize_category,
     parse_binary,
     tally_votes,
 )
 
+# LoRA mode: serve the verifier adapter on the base model (see main.sh).
+LORA_KWARGS, LORA_REQUEST = vllm_adapter(adapter_from_env())
 SUPERVISOR_VALIDITY_ENABLED = os.getenv("SUPERVISOR_VALIDITY_ENABLED", "1") == "1"
 # Candidates whose vote agreement (majority count / valid votes) falls outside
 # this band are dropped: too-unanimous candidates carry little training signal.
@@ -135,6 +137,7 @@ def build_vllm_model(args):
                 seed=int(args.suffix),
                 # One candidate image per prompt, never video (skips max-size video profiling).
                 limit_mm_per_prompt={"image": 1, "video": 0},
+                **LORA_KWARGS,
             )
         except Exception as exc:
             last_exc = exc
@@ -167,35 +170,11 @@ except FileNotFoundError:
 query_items = []
 structural_rejects = {}
 for item in data:
-    question = item.get("question", "")
-    if not question:
+    checked = structural_query_item(item)
+    if checked is None:
         continue
-    category = normalize_category(item.get("declared_category"))
-    query_item = {
-        "question": question,
-        "question_type": item.get("question_type", ""),
-        "declared_category": category or str(item.get("declared_category") or "unknown"),
-        "time_bounds": item.get("time_bounds"),
-        "graph_path": item.get("graph_path", ""),
-        "category_match": 0,
-        "valid": 0,
-        "validity_reason": "",
-    }
-    reason = None
-    if category is None:
-        reason = "skipped_unknown_category"
-    else:
-        try:
-            graph = load_graph(query_item["graph_path"])
-            query = {"category": category, "time_bounds": query_item["time_bounds"]}
-            query_item["candidates"] = plan(graph, query)
-            if not query_item["candidates"]:
-                reason = "skipped_no_candidates"
-        except Exception as exc:
-            print(f"[{args.suffix}] WARNING: planning failed for '{question[:50]}...': {exc}")
-            reason = "skipped_graph_or_plan_failed"
+    query_item, reason = checked
     if reason:
-        query_item["validity_reason"] = reason
         structural_rejects[reason] = structural_rejects.get(reason, 0) + 1
     query_items.append(query_item)
 
@@ -241,7 +220,7 @@ if SUPERVISOR_VALIDITY_ENABLED:
                 item["question"],
                 item["declared_category"],
                 item["time_bounds"],
-                build_graph_context(load_graph(item["graph_path"]), args.max_context_segments),
+                build_graph_context(load_graph(item["graph_path"]), args.max_context_segments, item.get("focus_unit")),
             ),
         }
         for item in eligible_items
@@ -251,7 +230,7 @@ if SUPERVISOR_VALIDITY_ENABLED:
         f"[{now()}][{args.suffix}] Running joint validity+category verification for "
         f"{len(validity_chats)} generated queries..."
     )
-    validity_responses = model.generate(validity_chats, sampling_params=judge_sample_params, use_tqdm=True)
+    validity_responses = model.generate(validity_chats, sampling_params=judge_sample_params, use_tqdm=True, lora_request=LORA_REQUEST)
     for debug_idx, response in enumerate(validity_responses[:3]):
         raw_text = response.outputs[0].text if response.outputs else ""
         print(f"[{args.suffix}] [validity-debug-{debug_idx}] {raw_text}")
@@ -351,7 +330,7 @@ for batch_start in range(0, total_prompts, BATCH_SIZE):
         f"(prompts {batch_start}-{batch_end-1})..."
     )
     try:
-        batch_responses = model.generate(batch, sampling_params=sample_params, use_tqdm=True)
+        batch_responses = model.generate(batch, sampling_params=sample_params, use_tqdm=True, lora_request=LORA_REQUEST)
     except Exception as e:
         debug_path = OUTPUT_FILE.replace(
             "_results.json",
@@ -374,7 +353,7 @@ for batch_start in range(0, total_prompts, BATCH_SIZE):
         for local_idx, single_prompt in enumerate(batch):
             single_index = batch_start + local_idx
             try:
-                single_output = model.generate([single_prompt], sampling_params=sample_params, use_tqdm=False)
+                single_output = model.generate([single_prompt], sampling_params=sample_params, use_tqdm=False, lora_request=LORA_REQUEST)
                 recovered_responses.extend(single_output)
             except Exception as single_exc:
                 single_debug_path = OUTPUT_FILE.replace(
@@ -428,29 +407,10 @@ for response, entry in zip(responses, candidate_entries):
         vote_skips["out_of_band"] += 1
         continue
 
-    query_item = entry["query"]
-    candidate = entry["candidate"]
-    results_all.append({
-        "question": entry["problem"],
-        "answer": str(pseudo_label),
-        "score": score,
-        "image": image_to_b64(entry["image_pil"]),
-        "question_type": query_item["question_type"],
-        "query": query_item["question"],
-        "declared_category": query_item["declared_category"],
-        # upload.py balances on declared_skill; the category takes its place.
-        "declared_skill": query_item["declared_category"],
-        "category_match": query_item["category_match"],
-        "valid": query_item["valid"],
-        "validity_reason": query_item["validity_reason"],
-        # No answer supervisor in the per-candidate pipeline; upload.py filters on this.
-        "supervisor_correct": 1,
-        "graph_path": query_item["graph_path"],
-        "time_bounds": query_item["time_bounds"],
-        "candidate_id": candidate["candidate_id"],
-        "candidate": {key: candidate[key] for key in ("kind", "segment_ids", "spans", "captions", "entity_ids")},
-        "results": votes,
-    })
+    results_all.append(candidate_result_row(
+        entry["query"], entry["candidate"], entry["problem"], pseudo_label, score, votes,
+        image_to_b64(entry["image_pil"]),
+    ))
 
 grade_elapsed = time.time() - grade_start
 print(

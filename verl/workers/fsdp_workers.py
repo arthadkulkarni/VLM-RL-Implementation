@@ -52,6 +52,7 @@ from ..utils.fsdp_utils import (
     offload_fsdp_model,
     offload_fsdp_optimizer,
 )
+from ..utils.lora_utils import apply_lora
 from ..utils.model_utils import print_gpu_memory_usage, print_model_size
 from ..utils.tokenizer import get_processor, get_tokenizer
 from ..utils.torch_dtypes import PrecisionType
@@ -97,6 +98,7 @@ class FSDPWorker(Worker):
 
         self._use_param_offload = False
         self._use_optimizer_offload = False
+        self._lora_rank = 0  # > 0 when the actor trains a LoRA adapter
         if self._is_actor:
             self._use_param_offload = self.config.actor.offload.offload_params
             self._use_optimizer_offload = self.config.actor.offload.offload_optimizer
@@ -249,6 +251,20 @@ class FSDPWorker(Worker):
             else:
                 self.print_rank0("No vision tower found.")
 
+        if self._is_actor and model_config.lora.enabled:
+            if model_config.enable_gradient_checkpointing:
+                model.enable_input_require_grads()  # the frozen embedding feeds checkpointed blocks
+            materialize = (not fsdp_config.enable_rank0_init) or self.device_mesh.get_local_rank("fsdp") == 0
+            model = apply_lora(model, model_config.lora, materialize=materialize).to(torch_dtype)
+            fsdp_config.use_orig_params = True  # frozen base and trainable adapter share flat params
+            self._lora_rank = model.peft_config["default"].r
+            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            total = sum(p.numel() for p in model.parameters())
+            self.print_rank0(
+                f"LoRA r={self._lora_rank} from {model_config.lora.adapter_path or 'fresh init'}: "
+                f"{trainable / 1e6:.1f}M of {total / 1e6:.1f}M params trainable."
+            )
+
         dist.barrier()
         print_model_size(model)
         print_gpu_memory_usage("After huggingface model init")
@@ -337,6 +353,7 @@ class FSDPWorker(Worker):
             config=self.config.rollout,
             tokenizer=self.tokenizer,
             processor=self.processor,
+            lora_rank=self._lora_rank,
         )
         self.rollout_sharding_manager = FSDPVLLMShardingManager(
             module=self.fsdp_module,
@@ -520,7 +537,9 @@ class FSDPWorker(Worker):
                 offload_fsdp_optimizer(optimizer=self.optimizer)
 
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
-            output = self.rollout.generate_sequences(prompts=prompts)
+            output = self.rollout.generate_sequences(
+                prompts=prompts, lora_request=self.rollout_sharding_manager.lora_request
+            )
             output = self.rollout_sharding_manager.postprocess_data(output)
 
         output = output.to("cpu")

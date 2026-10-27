@@ -1,0 +1,22 @@
+{
+  "video_id": "kitchen",
+  "fps": 30,
+  "timeline": ["kitchen_scene000", "kitchen_scene001", "kitchen_scene002", "kitchen_scene003"],
+  "segments": [
+    {"segment_id": "kitchen_scene000", "level": "scene", "start_sec": 0.0, "end_sec": 5.0,
+     "caption": "A man fills a kettle with water at the sink.", "entity_ids": ["ent_0", "ent_1"]},
+    {"segment_id": "kitchen_scene001", "level": "scene", "start_sec": 5.0, "end_sec": 9.0,
+     "caption": "The man puts the kettle on the stove.", "entity_ids": ["ent_0", "ent_1"]},
+    {"segment_id": "kitchen_scene002", "level": "scene", "start_sec": 9.0, "end_sec": 14.0,
+     "caption": "The man takes a mug from the cupboard.", "entity_ids": ["ent_0", "ent_2"]},
+    {"segment_id": "kitchen_scene003", "level": "scene", "start_sec": 14.0, "end_sec": 20.0,
+     "caption": "A woman enters and pours tea into the mug.", "entity_ids": ["ent_2", "ent_3"]}
+  ],
+  "entities": [
+    {"entity_id": "ent_0", "name": "man", "type": "person"},
+    {"entity_id": "ent_1", "name": "kettle", "type": "object"},
+    {"entity_id": "ent_2", "name": "mug", "type": "object"},
+    {"entity_id": "ent_3", "name": "woman", "type": "person"}
+  ],
+  "edges": []
+}

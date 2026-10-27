@@ -22,6 +22,8 @@ import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from collections import Counter
+
+from video_verifier.prompts import split_graph_ref
 STORAGE_PATH = os.getenv("STORAGE_PATH")
 if STORAGE_PATH is None:
     STORAGE_PATH = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -43,6 +45,13 @@ DUPLICATE_PENALTY_WEIGHT = float(os.getenv("RISE_DUPLICATE_PENALTY_WEIGHT", "0.2
 
 TEMP_RESULTS_DIR = os.path.join(STORAGE_PATH, "temp_results")
 os.makedirs(TEMP_RESULTS_DIR, exist_ok=True)
+# Per-sample questioner rewards, one JSON line per sample, appended every call.
+# The batch-mean metrics can't express per-category reward, and the reward
+# server's *_results.json files are deleted after each step. Set to "" to disable.
+QUESTIONER_REWARD_LOG = os.getenv(
+    "QUESTIONER_REWARD_LOG", os.path.join(STORAGE_PATH, "questioner_rewards.jsonl")
+)
+_REWARD_CALL_COUNT = 0
 
 # The questioner's query categories (the Frozen Planner's taxonomy). Named
 # "skills" for continuity with RISE's skill-balance machinery.
@@ -147,11 +156,12 @@ def format_reward(predict: str) -> float:
 
 
 def parse_time_bounds(text):
-    """"start, end" in seconds -> [start, end], or None if malformed."""
-    numbers = re.findall(r"\d+(?:\.\d+)?", text or "")
-    if len(numbers) != 2:
+    """"start, end" -> [start, end] in seconds, or None if malformed. Each time
+    is seconds or [H:]MM:SS(.s), the format the timeline in the prompt uses."""
+    times = re.findall(r"\d+(?::\d+){0,2}(?:\.\d+)?", text or "")
+    if len(times) != 2:
         return None
-    start, end = float(numbers[0]), float(numbers[1])
+    start, end = (sum(float(part) * 60 ** i for i, part in enumerate(reversed(t.split(":")))) for t in times)
     return [start, end] if start <= end else None
 
 
@@ -260,18 +270,62 @@ def difficulty_from_candidates(candidate_scores):
     return sum(min(c, 1 - c) for c in candidate_scores) / len(candidate_scores)
 
 
+def log_category_rewards(results, scores, difficulty_results) -> None:
+    """Print mean reward per declared category and append per-sample rows to
+    QUESTIONER_REWARD_LOG."""
+    global _REWARD_CALL_COUNT
+    _REWARD_CALL_COUNT += 1
+    by_category = {}
+    for item, score_item in zip(results, scores):
+        by_category.setdefault(item.get("declared_skill") or "unknown", []).append(score_item)
+    print(f"[reward-by-category] call={_REWARD_CALL_COUNT} n={len(scores)}")
+    for category, items in sorted(by_category.items(), key=lambda kv: -len(kv[1])):
+        n = len(items)
+        mean = lambda key: sum(x[key] for x in items) / n
+        print(
+            f"[reward-by-category]   {category:<12} n={n:<3} "
+            f"overall={mean('overall'):+.4f} difficulty={mean('difficulty'):+.4f} "
+            f"validity={mean('validity'):.3f} category_match={mean('skill_match'):.3f} "
+            f"skill_bonus={mean('skill_balance_bonus'):.4f} candidates={mean('judged_candidates'):.1f}"
+        )
+    if not QUESTIONER_REWARD_LOG:
+        return
+    timestamp = time.time()
+    with open(QUESTIONER_REWARD_LOG, "a") as f:
+        for item, score_item, difficulty in zip(results, scores, difficulty_results):
+            row = {
+                "time": timestamp,
+                "pid": os.getpid(),
+                "call": _REWARD_CALL_COUNT,
+                "category": item.get("declared_skill"),
+                "question": item.get("question", ""),
+                "time_bounds": item.get("time_bounds"),
+                "graph_path": item.get("graph_path"),
+                "focus_unit": item.get("focus_unit"),
+                # The raw rollout text, so questioner_drift_diag.py can rescore it.
+                "response": item.get("response"),
+                "candidate_scores": difficulty.get("candidate_scores") or [],
+                "coarse_scores": difficulty.get("coarse_scores") or [],
+            }
+            # Drop the per-category one-hot indicators; "category" already says it.
+            row.update({k: v for k, v in score_item.items() if k not in {f"skill_{c}" for c in ALLOWED_SKILLS}})
+            f.write(json.dumps(row) + "\n")
+
+
 def compute_score(predicts: List[str], ground_truths: List[str], questions: List[str], description_answers: List[str], format_weight: float = 0.1, images: Optional[List[str]] = None) -> List[Dict[str, float]]:
-    """Questioner reward. Each sample's ground_truth carries its video's graph
-    path (the questioner parquet's answer column); images are unused."""
+    """Questioner reward. Each sample's ground_truth carries its video's
+    graph_ref (the questioner parquet's answer column: graph path, plus the
+    focus unit for a long video); images are unused."""
     print("Computing rewards")
     results = []
     format_components = []
     skill_counts = get_recent_skill_counts() if (SKILL_AWARE_ENABLED and SKILL_BALANCE_ENABLED) else Counter()
-    for predict, graph_path in zip(predicts, ground_truths):
-        predict = re.sub(r"\s*(<|>|/)\s*", r"\1", predict)  # handle qwen2.5vl-32b format
+    for raw_predict, graph_path in zip(predicts, ground_truths):
+        predict = re.sub(r"\s*(<|>|/)\s*", r"\1", raw_predict)  # handle qwen2.5vl-32b format
         format_info = compute_format_components(predict)
         item = match(predict) or {"question": "", "declared_skill": None, "time_bounds": None}
-        item["graph_path"] = str(graph_path)
+        item["graph_path"], item["focus_unit"] = split_graph_ref(graph_path)
+        item["response"] = raw_predict
         results.append(item)
         format_components.append(format_info)
 
@@ -281,6 +335,8 @@ def compute_score(predicts: List[str], ground_truths: List[str], questions: List
             "declared_category": item.get("declared_skill"),
             "time_bounds": item.get("time_bounds"),
             "graph_path": item["graph_path"],
+            # the window a long video's prompt showed in full; the validity judge sees the same view
+            "focus_unit": item.get("focus_unit"),
         }
 
     gated_indices = [
@@ -360,10 +416,19 @@ def compute_score(predicts: List[str], ground_truths: List[str], questions: List
             "difficulty": difficulty_score,
             "penalty": penalty,
             "num_candidates": float(difficulty_results[i].get("num_candidates", 0)),
+            # Coarse-to-fine search (RISE_HIERARCHICAL_SEARCH on the reward
+            # servers): |C(x, q)| before the search, and units judged / accepted.
+            "planned_candidates": float(difficulty_results[i].get("planned_candidates", 0)),
+            "coarse_units": float(difficulty_results[i].get("num_units", 0)),
+            "accepted_units": float(difficulty_results[i].get("accepted_units", 0)),
+            # Verifier judgments drawn for this query (coarse + fine; fewer
+            # than G per candidate under RISE_VERIFIER_INITIAL_SAMPLES).
+            "verifier_samples": float(difficulty_results[i].get("verifier_samples", 0)),
             "judged_candidates": float(len(candidate_scores)),
         }
         score_item.update(skill_indicator_metrics)
         scores.append(score_item)
+    log_category_rewards(results, scores, difficulty_results)
     if QUESTIONER_DEBUG_SAMPLES > 0:
         debug_count = min(QUESTIONER_DEBUG_SAMPLES, len(scores))
         print(f"[questioner-debug] showing {debug_count}/{len(scores)} samples")

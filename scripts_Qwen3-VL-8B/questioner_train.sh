@@ -20,6 +20,7 @@ export STORAGE_PATH="${STORAGE_PATH:-../storage_${PROJECT_NAME}}"
 model_save_root="${MODEL_SAVE_ROOT:-${STORAGE_PATH}/models}"
 
 source scripts_Qwen3-VL-8B/runtime_cleanup.sh
+source scripts_Qwen3-VL-8B/lora_mode.sh
 trap runtime_cleanup_all EXIT
 
 mkdir -p "${model_save_root}"
@@ -58,7 +59,12 @@ echo "Solver model for reward: ${solver_model_path}"
 echo "Questioner model: ${questioner_model_path}"
 echo "Target steps: ${train_steps}"
 echo "GPU split: ${train_gpus} training (${train_cuda_devices}), ${reward_gpus} reward server(s)"
+if lora_enabled; then
+  echo "LoRA mode: questioner adapter '${RISE_QUESTIONER_ADAPTER:-}', judge adapter '$(solver_serve_adapter)'"
+fi
 
+# In LoRA mode the judge servers serve the verifier adapter A_V on the base.
+RISE_LORA_PATH="$(lora_serve_path "$(solver_serve_adapter)")" \
 RISE_REWARD_GPU_OFFSET="${train_gpus}" RISE_REWARD_SERVERS="${reward_gpus}" \
   bash vllm_service_init/start.sh "${solver_model_path}" "${RUN_ID}"
 
@@ -128,29 +134,13 @@ trainer_args=(
 if [ -n "${load_checkpoint_path}" ]; then
   trainer_args+=("trainer.load_checkpoint_path=${load_checkpoint_path}")
 fi
+if lora_enabled; then
+  mapfile -t lora_args < <(lora_trainer_args "${RISE_QUESTIONER_ADAPTER:-}")
+  trainer_args+=("${lora_args[@]}")
+fi
 
 echo "Training questioner..."
 CUDA_VISIBLE_DEVICES="${train_cuda_devices}" python3 -m verl.trainer.main "${trainer_args[@]}"
 
-# Merge the step the trainer actually saved, which can differ from the
-# requested one if training ended early.
-latest_step_file="${model_save_root}/${experiment_name}/latest_global_step.txt"
-if [ ! -f "${latest_step_file}" ]; then
-  echo "ERROR: questioner trainer saved no checkpoint (missing ${latest_step_file})" >&2
-  exit 1
-fi
-saved_step="$(tr -d '[:space:]' < "${latest_step_file}")"
-step_dir="${model_save_root}/${experiment_name}/global_step_${saved_step}"
-python scripts_Qwen3-VL-8B/model_merger.py --local_dir "${step_dir}/actor"
-
-if [ "${saved_step}" != "${train_steps}" ]; then
-  echo "ERROR: questioner trainer stopped at global_step_${saved_step}, expected global_step_${train_steps}" >&2
-  exit 1
-fi
-
-if [ ! -f "${step_dir}/actor/huggingface/config.json" ]; then
-  echo "ERROR: merged questioner checkpoint is incomplete: ${step_dir}/actor/huggingface" >&2
-  exit 1
-fi
-
-echo "Questioner training finished: ${step_dir}/actor/huggingface"
+result="$(finish_stage_checkpoint questioner "${model_save_root}/${experiment_name}" "${train_steps}")"
+echo "Questioner training finished: ${result}"

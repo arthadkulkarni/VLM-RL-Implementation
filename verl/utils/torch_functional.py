@@ -64,7 +64,8 @@ def log_probs_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.T
     if FLAH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE:
         output = log_probs_from_logits_flash_attn(logits, labels)
     else:  # fall back to torch kernel, upcast logits to fp32
-        output = F.cross_entropy(logits.float(), labels, reduction="none")
+        # cross_entropy is the NLL; negate it, as the flash-attn path does.
+        output = -F.cross_entropy(logits.float(), labels, reduction="none")
 
     return output.view(*batch_dim)
 
@@ -195,7 +196,11 @@ def get_constant_schedule_with_warmup(
     """Get the lr scheduler for constant lr."""
 
     def lr_lambda(current_step: int) -> float:
-        return min(1.0, float(current_step) / float(max(1, num_warmup_steps)))
+        # Full LR once warmup is over, including at step 0 without warmup
+        # (min(1, step / max(1, warmup)) gave the first step LR 0).
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        return 1.0
 
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 

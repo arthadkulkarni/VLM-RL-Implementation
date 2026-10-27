@@ -25,6 +25,7 @@ from vllm import LLM, RequestOutput, SamplingParams
 
 from ...protocol import DataProto
 from ...utils import torch_functional as VF
+from ...utils.lora_utils import vllm_lora_engine_kwargs
 from ...utils.torch_dtypes import PrecisionType
 from ...utils.vllm_utils import VLLMHijack
 from .base import BaseRollout
@@ -53,6 +54,7 @@ class vLLMRollout(BaseRollout):
         config: RolloutConfig,
         tokenizer: PreTrainedTokenizer,
         processor: Optional[ProcessorMixin] = None,
+        lora_rank: int = 0,
     ):
         """A vLLM rollout. It requires the module is supported by the vllm.
 
@@ -60,6 +62,8 @@ class vLLMRollout(BaseRollout):
             module: module here follows huggingface APIs
             config: DictConfig
             tokenizer: the task/model tokenizer
+            lora_rank: rank of the actor's LoRA adapter; > 0 serves the base model
+                with LoRA slots, and generate_sequences takes the adapter request
         """
         super().__init__()
         self.rank = int(os.getenv("RANK", "0"))
@@ -92,6 +96,7 @@ class vLLMRollout(BaseRollout):
             disable_mm_preprocessor_cache=True,
             enable_chunked_prefill=config.enable_chunked_prefill,
             enable_sleep_mode=True,
+            **(vllm_lora_engine_kwargs(lora_rank) if lora_rank > 0 else {}),
         )
 
         # Offload vllm model to reduce peak memory usage
@@ -104,7 +109,9 @@ class vLLMRollout(BaseRollout):
         }
         default_sampling_params = SamplingParams()
         for key in config.to_dict().keys():
-            if hasattr(default_sampling_params, key):
+            # The engine is already seeded; a per-request seed would replay the
+            # same random draws every step (identical rollouts across steps).
+            if key != "seed" and hasattr(default_sampling_params, key):
                 sampling_kwargs[key] = getattr(config, key)
 
         print(f"Sampling params: {sampling_kwargs}.")
@@ -127,7 +134,7 @@ class vLLMRollout(BaseRollout):
             setattr(self.sampling_params, key, value)
 
     @torch.no_grad()
-    def generate_sequences(self, prompts: DataProto) -> DataProto:
+    def generate_sequences(self, prompts: DataProto, lora_request=None) -> DataProto:
         # left-padded attention_mask
         input_ids: torch.Tensor = prompts.batch["input_ids"]  # (bs, prompt_length)
         attention_mask: torch.Tensor = prompts.batch["attention_mask"]
@@ -152,7 +159,10 @@ class vLLMRollout(BaseRollout):
         # users can customize different sampling_params at different run
         with self.update_sampling_params(**prompts.meta_info):
             completions: List[RequestOutput] = self.inference_engine.generate(
-                prompts=vllm_inputs, sampling_params=self.sampling_params, use_tqdm=(self.rank == 0)
+                prompts=vllm_inputs,
+                sampling_params=self.sampling_params,
+                use_tqdm=(self.rank == 0),
+                lora_request=lora_request,
             )
             response_ids = [output.token_ids for completion in completions for output in completion.outputs]
             response_ids = VF.pad_2d_list_to_length(

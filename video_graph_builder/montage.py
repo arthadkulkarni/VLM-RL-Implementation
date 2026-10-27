@@ -63,13 +63,19 @@ def stack_montages(top, bottom, labels=("Segment A", "Segment B"), max_pixels=MA
     frame strip) into one labelled image, so a single-image VLM prompt can
     compare entities across the two segments.
     """
-    width = max(top.width, bottom.width)
-    height = top.height + bottom.height + 2 * LABEL_HEIGHT + GUTTER
+    return stack_montage_rows([top, bottom], labels, max_pixels=max_pixels)
+
+
+def stack_montage_rows(montages, labels, max_pixels=MAX_PAIR_PIXELS):
+    """Stack montages top to bottom, each under its label, and downscale the
+    result to at most max_pixels."""
+    width = max(montage.width for montage in montages)
+    height = sum(montage.height for montage in montages) + len(montages) * LABEL_HEIGHT + (len(montages) - 1) * GUTTER
     stacked = Image.new("RGB", (width, height), BG_COLOR)
     draw = ImageDraw.Draw(stacked)
 
     y = 0
-    for montage, label in zip((top, bottom), labels):
+    for montage, label in zip(montages, labels):
         draw.text((4, y + 2), label, fill=TEXT_COLOR)
         stacked.paste(montage, (0, y + LABEL_HEIGHT))
         y += LABEL_HEIGHT + montage.height + GUTTER

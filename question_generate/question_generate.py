@@ -6,18 +6,23 @@ from typing import List
 from vllm.outputs import RequestOutput
 import sys, os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+from verl.utils.lora_utils import adapter_from_env, vllm_adapter
 from verl.utils.vllm_utils import VLLMHijack
+from question_evaluate.records import generated_record
 from video_verifier.prompts import (
     build_questioner_system_prompt,
     build_questioner_user_prompt,
     load_graph,
-    parse_questioner_output,
+    focus_windows,
+    needs_focus,
 )
 import glob
 import json
 import os
 import random
 STORAGE_PATH = os.getenv("STORAGE_PATH")
+# LoRA mode: serve the questioner adapter on the base model (see main.sh).
+LORA_KWARGS, LORA_REQUEST = vllm_adapter(adapter_from_env())
 QUESTION_GENERATE_SHUFFLE = os.getenv("QUESTION_GENERATE_SHUFFLE", "1") == "1"
 QUESTION_GENERATE_SHUFFLE_SEED = int(os.getenv("QUESTION_GENERATE_SHUFFLE_SEED", "42"))
 
@@ -97,6 +102,7 @@ def build_vllm_model(args):
                 gpu_memory_utilization=args.gpu_mem_util,
                 max_model_len=args.max_model_len,
                 seed=int(args.suffix),
+                **LORA_KWARGS,
             )
         except Exception as exc:
             last_exc = exc
@@ -172,6 +178,11 @@ def main(args):
         stop_token_ids=[tokenizer.eos_token_id],
     )
 
+    # A long video's prompt shows one focus window in full (build_graph_context);
+    # which one is drawn per sample, seeded by this shard, so repeated samples
+    # of a video ask about different parts of it.
+    focus_rng = random.Random(f"{args.suffix}:{start_index}")
+
     # Process each sampled video graph
     results = []
     target_count = len(sample_indices)
@@ -185,14 +196,17 @@ def main(args):
             print(f"Failed to load graph {graph_path}: {e}")
             continue
 
+        focus_unit = (
+            focus_rng.randrange(len(focus_windows(graph))) if needs_focus(graph, args.max_context_segments) else None
+        )
         prompt = (
             f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
-            f"<|im_start|>user\n{build_questioner_user_prompt(graph, args.max_context_segments)}<|im_end|>\n"
+            f"<|im_start|>user\n{build_questioner_user_prompt(graph, args.max_context_segments, focus_unit)}<|im_end|>\n"
             "<|im_start|>assistant\n"
         )
 
         try:
-            completions: List[RequestOutput] = model.generate([{"prompt": prompt}], sampling_params=sample_params)
+            completions: List[RequestOutput] = model.generate([{"prompt": prompt}], sampling_params=sample_params, lora_request=LORA_REQUEST)
         except Exception as e:
             print(f"Generation failed for dataset_idx={i}: {e}")
             results.append({
@@ -209,16 +223,7 @@ def main(args):
             continue
 
         for completion in completions:
-            response = completion.outputs[0].text
-            parsed = parse_questioner_output(response)
-            results.append({
-                "declared_category": parsed["category"] or "unknown",
-                # Empty when unparseable; evaluate.py drops empty questions.
-                "question": parsed["question"] or "",
-                "time_bounds": parsed["time_bounds"],
-                "graph_path": graph_path,
-                "raw_response": response,
-            })
+            results.append(generated_record(completion.outputs[0].text, graph_path, focus_unit))
 
     # Save results
     output_file = f"{STORAGE_PATH}/generated_question/{args.save_name}_{args.suffix}.json"

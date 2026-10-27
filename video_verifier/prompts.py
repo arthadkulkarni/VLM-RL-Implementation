@@ -10,6 +10,9 @@ videos, categories and candidates with the same text.
     whether a query is well-posed, grounded, and of its declared category;
   - candidates: one Verifier prompt per Planner candidate c_i, shown through its
     segment montage(s), asking for a binary \\boxed{1}/\\boxed{0} judgment;
+  - coarse units: for long videos, one Verifier prompt per Planner coarse unit
+    (a window of consecutive segments) asking whether any part of the query
+    happens there; only accepted units' candidates are judged;
   - votes: G sampled judgments per candidate -> consistency c_i and ŷ_i.
 """
 
@@ -21,8 +24,8 @@ import re
 from mathruler.grader import extract_boxed_content
 from PIL import Image
 
-from frozen_planner.planner import CATEGORIES
-from video_graph_builder.montage import stack_montages
+from frozen_planner.planner import CATEGORIES, PlannerConfig, coarse_units
+from video_graph_builder.montage import stack_montage_rows, stack_montages
 
 CATEGORY_CONTEXTS = {
     "static": (
@@ -141,27 +144,171 @@ def load_montage(graph_path, segment):
     return Image.open(path).convert("RGB")
 
 
-def build_graph_context(graph, max_segments):
-    """Text view of a video graph for the validity judge: timeline captions
-    and the linked entities."""
-    segments = {seg["segment_id"]: seg for seg in graph["segments"]}
-    timeline = graph.get("timeline") or [
-        seg["segment_id"] for seg in sorted(graph["segments"], key=lambda s: s["start_sec"])
+FOCUS_SEP = "#focus="
+
+
+# Focus windows of the hierarchical view: >= 60 s, at most 96 per video, so a
+# window stays ~20 segments even at 3 hours and fits the view's focus budget.
+# Finer than the overview's parts (the Planner's default coarse units, <= 32).
+FOCUS_CONFIG = PlannerConfig(coarse_min_sec=60.0, max_coarse_units=96)
+
+
+def focus_windows(graph):
+    """The windows a long video's questioner prompt can show in full; a
+    focus_unit indexes this list."""
+    return coarse_units(graph, FOCUS_CONFIG)
+
+
+def graph_ref(graph_path, focus_unit=None):
+    """A questioner sample's video: the graph path, plus the focus window
+    (focus_windows) its prompt shows in full when the video is too long to show
+    whole. Carried as the questioner parquet's answer / reward ground_truth
+    string."""
+    return graph_path if focus_unit is None else f"{graph_path}{FOCUS_SEP}{int(focus_unit)}"
+
+
+def split_graph_ref(ref):
+    """graph_ref's inverse: -> (graph_path, focus_unit or None)."""
+    ref = str(ref)
+    if FOCUS_SEP in ref:
+        path, focus = ref.rsplit(FOCUS_SEP, 1)
+        return path, int(focus)
+    return ref, None
+
+
+def _timeline(graph):
+    return graph.get("timeline") or [seg["segment_id"] for seg in sorted(graph["segments"], key=lambda s: s["start_sec"])]
+
+
+def needs_focus(graph, max_segments):
+    """Whether build_graph_context shows this video hierarchically (its
+    timeline exceeds max_segments) -- then each prompt has a focus unit."""
+    return 0 < max_segments < len(_timeline(graph))
+
+
+# Character budget of the hierarchical view. Captions run ~3.4 characters per
+# Qwen3-VL token, so 20000 is ~6k tokens; with the questioner system prompt
+# the whole prompt measured <= ~6.9k tokens on 1-3 hour videos, under
+# data.max_prompt_length = 8192, past which a prompt is silently dropped.
+MAX_CONTEXT_CHARS = int(os.getenv("RISE_MAX_CONTEXT_CHARS", "20000"))
+# Long-video view only: captions clipped to CLIP_CHARS; the entity list keeps
+# the LONG_VIEW_ENTITIES most frequent, descriptions clipped to
+# ENTITY_CLIP_CHARS, leaving room for the overview's captions.
+CLIP_CHARS = 200
+LONG_VIEW_ENTITIES = 40
+# ... and keeps at least this many when the budget is tight.
+MIN_LONG_VIEW_ENTITIES = 15
+ENTITY_CLIP_CHARS = 100
+
+
+def _clip(text, limit):
+    text = (text or "").strip()
+    return text if limit is None or len(text) <= limit else text[: limit - 3].rstrip() + "..."
+
+
+def _entity_lines(entities, clip=None):
+    return [
+        f"- {entity.get('name', '')} ({entity.get('type', '')}): {_clip(entity.get('description', ''), clip)} "
+        f"[appears in {len(entity.get('segment_ids', []))} segments]"
+        for entity in entities
     ]
-    shown = evenly_spaced(timeline, max_segments)
-    lines = [f"Video timeline ({len(shown)} of {len(timeline)} segments shown):"]
-    for segment_id in shown:
-        seg = segments[segment_id]
-        lines.append(f"[{fmt_time(seg['start_sec'])}-{fmt_time(seg['end_sec'])}] {seg.get('caption', '').strip()}")
+
+
+def build_graph_context(graph, max_segments, focus_unit=None, max_chars=None):
+    """Text view of a video graph, shared by the questioner prompt and the
+    validity judge so both see the same video.
+
+    A timeline of at most max_segments segments is listed whole. A longer one
+    is shown hierarchically: an overview of the Planner's coarse units
+    (frozen_planner coarse_units, default PlannerConfig) with a few evenly
+    spaced captions each, and one focus window (focus_windows[focus_unit])
+    listed segment by segment. Both
+    together use at most max_segments caption lines (the focus unit at most
+    half) and at most max_chars characters (default MAX_CONTEXT_CHARS): the
+    overview gives up captions first, then entities, then the focus, so the prompt stays the
+    same size however long the video is. focus_unit=None spreads every line
+    over the overview.
+    """
+    segments = {seg["segment_id"]: seg for seg in graph["segments"]}
+    timeline = _timeline(graph)
     entities = graph.get("entities", [])
-    if entities:
-        lines.append(f"Entities ({len(entities)}):")
-        for entity in entities[:50]:
+
+    def caption_line(sid, clip=None):
+        seg = segments[sid]
+        return f"[{fmt_time(seg['start_sec'])}-{fmt_time(seg['end_sec'])}] {_clip(seg.get('caption', ''), clip)}"
+
+    if not needs_focus(graph, max_segments):
+        shown = evenly_spaced(timeline, max_segments)
+        lines = [f"Video timeline ({len(shown)} of {len(timeline)} segments shown):"]
+        lines += [caption_line(sid) for sid in shown]
+        if entities:
+            lines.append(f"Entities ({len(entities)}):")
+            lines += _entity_lines(entities[:50])
+        return "\n".join(lines)
+
+    max_chars = MAX_CONTEXT_CHARS if max_chars is None else max_chars
+    units = coarse_units(graph)
+    windows = focus_windows(graph)
+    focus = windows[focus_unit] if focus_unit is not None and 0 <= focus_unit < len(windows) else None
+    # Most widespread first: on a long video these are the recurring people and objects.
+    ranked = sorted(entities, key=lambda e: -len(e.get("segment_ids", [])))
+
+    # Part summaries from the graph build (video_graph_builder/part_summaries.py),
+    # matched to today's units by their segments; a part without one (older
+    # graph, failed summary) falls back to captions.
+    summaries = {
+        tuple(part.get("segment_ids", [])): part.get("summary", "").strip() for part in graph.get("parts") or []
+    }
+    unit_summary = [summaries.get(tuple(unit["segment_ids"]), "") for unit in units]
+
+    def render(per_unit, focus_lines, n_entities):
+        """per_unit lines per part: its summary (if any) counts as one, the
+        rest are evenly spaced captions."""
+        focus_shown = evenly_spaced(focus["segment_ids"], focus_lines) if focus else []
+        if any(unit_summary):
+            shows = "a summary" + (" and a few segment captions" if per_unit > 1 else "")
+        else:
+            shows = f"{'a few' if per_unit > 1 else 'one'} of its segment captions"
+        lines = [
+            f"Video overview: {len(timeline)} segments in {len(units)} parts. Each part shows {shows}"
+            + ("; the focus window is shown in full detail below." if focus else ".")
+        ]
+        for k, unit in enumerate(units):
+            start, end = unit["span"]
+            lines.append(f"Part {k + 1} [{fmt_time(start)}-{fmt_time(end)}], {len(unit['segment_ids'])} segments:")
+            captions = per_unit
+            if unit_summary[k]:
+                lines.append(f"  Summary: {unit_summary[k]}")
+                captions -= 1
+            if captions > 0:  # evenly_spaced treats a limit of 0 as "keep all"
+                lines += [f"  {caption_line(sid, CLIP_CHARS)}" for sid in evenly_spaced(unit["segment_ids"], captions)]
+        if focus:
+            start, end = focus["span"]
             lines.append(
-                f"- {entity.get('name', '')} ({entity.get('type', '')}): {entity.get('description', '').strip()} "
-                f"[appears in {len(entity.get('segment_ids', []))} segments]"
+                f"Focus [{fmt_time(start)}-{fmt_time(end)}] "
+                f"({len(focus_shown)} of {len(focus['segment_ids'])} segments shown):"
             )
-    return "\n".join(lines)
+            lines += [caption_line(sid, CLIP_CHARS) for sid in focus_shown]
+        if entities:
+            lines.append(f"Entities ({len(entities)}, most frequent first):")
+            lines += _entity_lines(ranked[:n_entities], ENTITY_CLIP_CHARS)
+        return "\n".join(lines)
+
+    focus_lines = min(len(focus["segment_ids"]), max_segments // 2) if focus else 0
+    per_unit = max(1, (max_segments - focus_lines) // len(units))
+    n_entities = min(len(ranked), LONG_VIEW_ENTITIES)
+    text = render(per_unit, focus_lines, n_entities)
+    while len(text) > max_chars:
+        if per_unit > 1:
+            per_unit -= 1
+        elif n_entities > MIN_LONG_VIEW_ENTITIES:
+            n_entities = max(MIN_LONG_VIEW_ENTITIES, n_entities - 5)
+        elif focus_lines > 1:
+            focus_lines -= 1
+        else:
+            break
+        text = render(per_unit, focus_lines, n_entities)
+    return text
 
 
 def build_validity_prompt(question, declared_category, time_bounds, graph_context):
@@ -204,6 +351,43 @@ def candidate_image(graph_path, graph, candidate, max_pixels, min_pixels):
     montages = [load_montage(graph_path, segments[sid]) for sid in candidate["segment_ids"]]
     image = montages[0] if len(montages) == 1 else stack_montages(montages[0], montages[1])
     return process_image_for_vllm(image, max_pixels=max_pixels, min_pixels=min_pixels)
+
+
+def coarse_unit_image(graph_path, graph, unit, max_segments, max_pixels, min_pixels):
+    """A coarse unit's view: the montages of up to max_segments of its
+    segments, evenly spaced, stacked in time order."""
+    segments = {seg["segment_id"]: seg for seg in graph["segments"]}
+    shown = [segments[sid] for sid in evenly_spaced(unit["segment_ids"], max_segments)]
+    image = stack_montage_rows(
+        [load_montage(graph_path, seg) for seg in shown],
+        [f"[{fmt_time(seg['start_sec'])}-{fmt_time(seg['end_sec'])}]" for seg in shown],
+        max_pixels=max_pixels,
+    )
+    return process_image_for_vllm(image, max_pixels=max_pixels, min_pixels=min_pixels)
+
+
+def build_coarse_problem(question, category, unit, graph):
+    """The Verifier's problem text for one coarse unit: does any event or
+    moment the query is about happen in this window? A relational query's two
+    events may fall in different windows, so a window showing either one
+    counts. Accepted units are expanded into their fine candidates."""
+    segments = {seg["segment_id"]: seg for seg in graph["segments"]}
+    start, end = unit["span"]
+    lines = [
+        f"Query: {question}",
+        f"Query category: {category}",
+        f"Video window [{fmt_time(start)}-{fmt_time(end)}], segment by segment:",
+    ]
+    for sid in unit["segment_ids"]:
+        seg = segments[sid]
+        lines.append(f"[{fmt_time(seg['start_sec'])}-{fmt_time(seg['end_sec'])}] {seg.get('caption', '').strip()}")
+    return (
+        "\n".join(lines) + "\n"
+        "The image shows frames from some of these segments, each row left to right in time, rows in time order. "
+        "Judge whether any event or moment the query is about -- all of it, or one of the events it relates -- "
+        "happens in this window. "
+        "Output \\boxed{1} if it does and \\boxed{0} if it does not."
+    )
 
 
 def build_candidate_problem(question, candidate, graph):
@@ -253,6 +437,16 @@ def tally_votes(texts):
     return votes, sum(votes) / len(votes)
 
 
+def needs_more_votes(texts, initial_samples):
+    """Adaptive sampling's stopping rule: after the first initial_samples
+    judgments of a candidate, stop only if every one parsed and they all agree
+    -- the candidate is then taken as unanimous (c_i = 0 or 1). Otherwise the
+    rest of the G samples are drawn. A split candidate can agree by chance in
+    its first few votes, so this trades some accuracy in d(x, q) for cost."""
+    votes, _ = tally_votes(texts)
+    return len(votes) < initial_samples or len(set(votes)) > 1
+
+
 def video_duration(graph):
     return max((seg["end_sec"] for seg in graph["segments"]), default=0.0)
 
@@ -288,20 +482,30 @@ def build_questioner_system_prompt():
     )
 
 
-def build_questioner_user_prompt(graph, max_context_segments):
+def build_questioner_user_prompt(graph, max_context_segments, focus_unit=None):
+    """The questioner's user turn. For a long video (see build_graph_context)
+    the query should be grounded in the focus part, and may relate it to
+    events elsewhere in the overview."""
+    focus_note = (
+        "Ground the query in the focus window; it may relate an event there to one elsewhere in the overview. "
+        if needs_focus(graph, max_context_segments) and focus_unit is not None
+        else ""
+    )
     return (
         f"Video duration: {video_duration(graph):.1f} seconds.\n"
-        f"{build_graph_context(graph, max_context_segments)}\n\n"
+        f"{build_graph_context(graph, max_context_segments, focus_unit)}\n\n"
+        f"{focus_note}"
         "Generate one new, challenging query about this video. Remember to format the output exactly as instructed."
     )
 
 
 def parse_time_bounds(text):
-    """"start, end" in seconds -> [start, end], or None if malformed."""
-    numbers = re.findall(r"\d+(?:\.\d+)?", text or "")
-    if len(numbers) != 2:
+    """"start, end" -> [start, end] in seconds, or None if malformed. Each time
+    is seconds or [H:]MM:SS(.s), the format the timeline in the prompt uses."""
+    times = re.findall(r"\d+(?::\d+){0,2}(?:\.\d+)?", text or "")
+    if len(times) != 2:
         return None
-    start, end = float(numbers[0]), float(numbers[1])
+    start, end = (sum(float(part) * 60 ** i for i, part in enumerate(reversed(t.split(":")))) for t in times)
     return [start, end] if start <= end else None
 
 

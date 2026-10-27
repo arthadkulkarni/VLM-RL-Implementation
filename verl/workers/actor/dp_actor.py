@@ -28,6 +28,7 @@ from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from ...protocol import DataProto
 from ...trainer import core_algos
 from ...utils import torch_functional as VF
+from ...utils.lora_utils import is_lora_key, is_peft_model, lora_b_norm
 from ...utils.py_functional import append_to_dict
 from ...utils.ulysses import gather_outputs_and_unpad, ulysses_pad_and_slice_inputs
 from .base import BasePPOActor
@@ -63,6 +64,7 @@ class DataParallelPPOActor(BasePPOActor):
         self.rank = int(os.getenv("RANK", "0"))
         self.actor_module = actor_module
         self.actor_optimizer = actor_optimizer
+        self.is_lora = is_peft_model(getattr(actor_module, "_fsdp_wrapped_module", actor_module))
         if config.use_torch_compile:
             self.log_probs_from_logits = torch.compile(VF.log_probs_from_logits, dynamic=True)
         else:
@@ -165,6 +167,15 @@ class DataParallelPPOActor(BasePPOActor):
             log_probs = self.log_probs_from_logits(logits, responses)  # (bsz, response_length)
 
         return log_probs
+
+    def _lora_grad_counts(self) -> Dict[str, int]:
+        """Parameters holding a gradient on this rank, and how many of them are
+        not adapter weights (must be 0: only the LoRA adapter trains)."""
+        with_grad = [name for name, param in self.actor_module.named_parameters() if param.grad is not None]
+        return {
+            "actor/params_with_grad": len(with_grad),
+            "actor/non_lora_params_with_grad": sum(not is_lora_key(name) for name in with_grad),
+        }
 
     def _optimizer_step(self) -> torch.Tensor:
         if isinstance(self.actor_module, FSDP):
@@ -300,7 +311,11 @@ class DataParallelPPOActor(BasePPOActor):
                     }
                     append_to_dict(metrics, batch_metrics)
 
+                if self.is_lora:
+                    append_to_dict(metrics, self._lora_grad_counts())
                 grad_norm = self._optimizer_step()
                 append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
+                if self.is_lora:
+                    append_to_dict(metrics, {"actor/lora_B_norm": lora_b_norm(self.actor_module)})
 
         return metrics

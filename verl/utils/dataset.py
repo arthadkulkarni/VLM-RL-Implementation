@@ -205,14 +205,17 @@ class RLHFDataset(Dataset, ImageProcessMixin):
         if self.image_key and self.image_key not in self.dataset.column_names:
             self.indexed_image_cols = self._discover_indexed_image_columns()
 
-        # Video-graph questioner: one row per video whose answer column holds the
-        # video graph's .json path. The prompt is built from the graph (text only),
-        # and the path is passed through as ground_truth for cot_val.py.
+        # Video-graph questioner: one row per video (or per focus window of a long
+        # video) whose answer column holds a graph_ref -- the video graph's .json
+        # path, optionally with "#focus=<unit>". The prompt is built from the graph
+        # (text only), and the ref is passed through as ground_truth for cot_val.py.
+        from video_verifier.prompts import split_graph_ref
+
         self.video_graph_questioner = (
             RISE_TRAINING_ROLE == "questioner"
             and len(self.dataset) > 0
             and self.answer_key in self.dataset.column_names
-            and str(self.dataset[0][self.answer_key]).endswith(".json")
+            and split_graph_ref(self.dataset[0][self.answer_key])[0].endswith(".json")
         )
         if self.video_graph_questioner:
             print(f"[dataset] Video-graph questioner mode: {len(self.dataset)} graphs from {data_path}")
@@ -336,12 +339,18 @@ class RLHFDataset(Dataset, ImageProcessMixin):
         return QUESTIONER_MASK_SOURCE_QA and RISE_TRAINING_ROLE == "questioner"
 
     def _build_graph_questioner_messages(self, example: Dict[str, Any]) -> List[Dict[str, Any]]:
-        from video_verifier.prompts import build_questioner_system_prompt, build_questioner_user_prompt, load_graph
+        from video_verifier.prompts import (
+            build_questioner_system_prompt,
+            build_questioner_user_prompt,
+            load_graph,
+            split_graph_ref,
+        )
 
-        graph = load_graph(example[self.answer_key])
+        graph_path, focus_unit = split_graph_ref(example[self.answer_key])
+        graph = load_graph(graph_path)
         return [
             {"role": "system", "content": build_questioner_system_prompt()},
-            {"role": "user", "content": build_questioner_user_prompt(graph, MAX_CONTEXT_SEGMENTS)},
+            {"role": "user", "content": build_questioner_user_prompt(graph, MAX_CONTEXT_SEGMENTS, focus_unit)},
         ]
 
     def _build_messages(self, example: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -639,7 +648,7 @@ class RLHFDataset(Dataset, ImageProcessMixin):
         example["_debug_prompt"] = prompt
         source_answer = example.pop(self.answer_key)
         if self.video_graph_questioner:
-            example["ground_truth"] = source_answer  # graph path, read by cot_val.py
+            example["ground_truth"] = source_answer  # graph_ref, read by cot_val.py
         else:
             example["ground_truth"] = "" if mask_source_qa else source_answer
         return example

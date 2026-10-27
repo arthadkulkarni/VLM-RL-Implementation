@@ -17,10 +17,17 @@ from typing import Optional, Union
 
 import torch
 import torch.distributed as dist
-from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict, set_state_dict
+from torch.distributed._tensor import DTensor
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_model_state_dict,
+    get_state_dict,
+    set_state_dict,
+)
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from transformers import PreTrainedModel, PreTrainedTokenizer, ProcessorMixin
 
+from ..lora_utils import ADAPTER_DIR, is_peft_model
 from .checkpoint_manager import BaseCheckpointManager
 
 
@@ -37,6 +44,11 @@ class FSDPCheckpointManager(BaseCheckpointManager):
     - sharded model states and optimizer states
     - full lr_scheduler states
     - huggingface tokenizer and config for ckpt merge
+
+    For a LoRA (peft) model only the trainable adapter is saved: the shards and
+    optimizer state cover adapter parameters only, and rank 0 also writes the
+    full adapter in peft's format to lora_adapter/ (merge it into the base with
+    scripts_Qwen3-VL-8B/merge_lora.py).
     """
 
     def __init__(
@@ -47,6 +59,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         processing_class: Union[PreTrainedTokenizer, ProcessorMixin],
     ):
         super().__init__(model, optimizer, lr_scheduler, processing_class)
+        self.is_lora = is_peft_model(model._fsdp_wrapped_module)
 
     def load_checkpoint(self, path: Optional[str] = None):
         if path is None:
@@ -63,7 +76,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         optim_state_dict = torch.load(optim_path, weights_only=False)
         extra_state_dict = torch.load(extra_path, weights_only=False)
 
-        state_dict_options = StateDictOptions(cpu_offload=True)
+        state_dict_options = StateDictOptions(cpu_offload=True, ignore_frozen_params=self.is_lora, strict=not self.is_lora)
         set_state_dict(
             model=self.model,
             optimizers=self.optimizer,
@@ -89,7 +102,7 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 f"[rank-{self.rank}]: VERL_CKPT_CPU_OFFLOAD={ckpt_cpu_offload_env}, "
                 f"save cpu_offload={ckpt_cpu_offload}."
             )
-        state_dict_options = StateDictOptions(cpu_offload=ckpt_cpu_offload)
+        state_dict_options = StateDictOptions(cpu_offload=ckpt_cpu_offload, ignore_frozen_params=self.is_lora)
         model_state_dict, optim_state_dict = get_state_dict(self.model, self.optimizer, options=state_dict_options)
         model_path = os.path.join(path, f"model_world_size_{self.world_size}_rank_{self.rank}.pt")
         optim_path = os.path.join(path, f"optim_world_size_{self.world_size}_rank_{self.rank}.pt")
@@ -111,12 +124,29 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         # wait for everyone to dump to local
         dist.barrier()
 
+        module = self.model._fsdp_wrapped_module
+        if self.is_lora:  # collective: every rank joins the gather, rank 0 writes
+            # Not full_state_dict=True: with ignore_frozen_params it raises a
+            # KeyError on ranks other than 0 (torch 2.8). Gather the sharded
+            # adapter tensors instead; they are small.
+            adapter_state = {
+                name: (tensor.full_tensor() if isinstance(tensor, DTensor) else tensor).cpu()
+                for name, tensor in get_model_state_dict(
+                    self.model, options=StateDictOptions(ignore_frozen_params=True)
+                ).items()
+            }
+            if self.rank == 0:
+                module.save_pretrained(os.path.join(path, ADAPTER_DIR), state_dict=adapter_state)
+                print(f"[rank-{self.rank}]: Saved LoRA adapter to {os.path.abspath(os.path.join(path, ADAPTER_DIR))}.")
+            del adapter_state
+            module = module.get_base_model()
+
         if self.rank == 0:
             hf_path = os.path.join(path, "huggingface")
             os.makedirs(hf_path, exist_ok=True)
-            assert isinstance(self.model._fsdp_wrapped_module, PreTrainedModel)
-            self.model._fsdp_wrapped_module.config.save_pretrained(hf_path)
-            self.model._fsdp_wrapped_module.generation_config.save_pretrained(hf_path)
+            assert isinstance(module, PreTrainedModel)
+            module.config.save_pretrained(hf_path)
+            module.generation_config.save_pretrained(hf_path)
             self.processing_class.save_pretrained(hf_path)
 
         dist.barrier()

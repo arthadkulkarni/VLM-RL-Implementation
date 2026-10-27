@@ -36,6 +36,12 @@ class PlannerConfig:
     # seconds apart (timeline segments never overlap, so this is what admits
     # neighbours across a cut).
     sync_tolerance_sec: float = 1.0
+    # Coarse-to-fine search (coarse_units / within_units): the timeline is cut
+    # into consecutive windows at least coarse_min_sec long, widened so a video
+    # has at most max_coarse_units of them. The coarse pass then costs
+    # O(max_coarse_units) Verifier calls however long the video is.
+    coarse_min_sec: float = 60.0
+    max_coarse_units: int = 32
 
 
 class GraphView:
@@ -201,3 +207,56 @@ def plan(graph, query, config=None):
     for k, candidate in enumerate(candidates):
         candidate["candidate_id"] = f"{view.video_id}_{category}_c{k:04d}"
     return candidates
+
+
+def coarse_units(graph, config=None):
+    """Coarse level of the coarse-to-fine search: consecutive runs of timeline
+    segments, each spanning at least unit_sec, where unit_sec =
+    max(coarse_min_sec, duration / max_coarse_units). Cuts fall on timeline
+    segment boundaries, so every finest-level segment is in exactly one unit; a
+    short remainder is merged into the last unit. Structural only, like the
+    rest of the Planner -- which units are worth expanding is the Verifier's
+    call. Returns [{"unit_id", "segment_ids", "span": [start_sec, end_sec]}] in
+    timeline order.
+    """
+    config = config or PlannerConfig()
+    view = GraphView(graph) if not isinstance(graph, GraphView) else graph
+    if not view.timeline:
+        return []
+    segments = [view.segments[sid] for sid in view.timeline]
+    duration = segments[-1]["end_sec"] - segments[0]["start_sec"]
+    unit_sec = max(config.coarse_min_sec, duration / max(1, config.max_coarse_units))
+
+    # Close a unit once it spans unit_sec: every unit but the last is then at
+    # least unit_sec long, so there are at most max_coarse_units of them.
+    groups = [[]]
+    for seg in segments:
+        if groups[-1] and groups[-1][-1]["end_sec"] - groups[-1][0]["start_sec"] >= unit_sec:
+            groups.append([])
+        groups[-1].append(seg)
+    if len(groups) > 1 and groups[-1][-1]["end_sec"] - groups[-1][0]["start_sec"] < unit_sec / 2:
+        groups[-2].extend(groups.pop())
+
+    return [
+        {
+            "unit_id": f"{view.video_id}_unit{k:03d}",
+            "segment_ids": [seg["segment_id"] for seg in group],
+            "span": [group[0]["start_sec"], group[-1]["end_sec"]],
+        }
+        for k, group in enumerate(groups)
+    ]
+
+
+def within_units(candidates, units):
+    """Fine level of the coarse-to-fine search: the candidates of C(x, q) whose
+    every span overlaps one of `units` (the coarse units the Verifier
+    accepted). A pair needs both segments covered, so a sequential or causal
+    pair whose events fall in two different accepted units is kept. Overlap
+    (not containment) also keeps scene nodes, which can straddle a unit cut.
+    """
+    spans = [unit["span"] for unit in units]
+    return [
+        candidate for candidate in candidates
+        if all(any(_overlaps({"start_sec": s, "end_sec": e}, span) for span in spans) for s, e in candidate["spans"])
+    ]
+
